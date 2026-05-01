@@ -1,0 +1,74 @@
+From ebe3bdcde67f42e81a17f6c2c59a08198da5eb73 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Thu, 30 Apr 2026 18:48:29 +0900
+Subject: [PATCH 18/18] Add --disable-media-suspend to disable suspend
+ completely
+
+Upstream-Status: Inappropriate [oe specific]
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ content/browser/renderer_host/render_process_host_impl.cc    | 1 +
+ media/base/media_switches.cc                                 | 4 ++++
+ media/base/media_switches.h                                  | 1 +
+ .../blink/renderer/platform/media/web_media_player_impl.cc   | 5 +++++
+ 4 files changed, 11 insertions(+)
+
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 67cdf0f30f..6ac938f7a2 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3470,6 +3470,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       switches::kDisableGpuMemoryBufferVideoFrames,
+       switches::kDisableHistogramCustomizer,
+       switches::kDisableLCDText,
++      switches::kDisableMediaSuspend,
+       switches::kDisableBackgroundMediaSuspend,
+       switches::kDisableNotifications,
+       switches::kDisableOriginTrialControlledBlinkFeatures,
+diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
+index 362688daba..b43b52615e 100644
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -50,6 +50,10 @@ const char kFailAudioStreamCreation[] = "fail-audio-stream-creation";
+ // Set number of threads to use for video decoding.
+ const char kVideoThreads[] = "video-threads";
+ 
++// Never suspend media.
++const char kDisableMediaSuspend[] =
++    "disable-media-suspend";
++
+ // Do not immediately suspend media in background tabs.
+ const char kDisableBackgroundMediaSuspend[] =
+     "disable-background-media-suspend";
+diff --git a/media/base/media_switches.h b/media/base/media_switches.h
+index d1a6a7e180..9d7e418369 100644
+--- a/media/base/media_switches.h
++++ b/media/base/media_switches.h
+@@ -38,6 +38,7 @@ MEDIA_EXPORT extern const char kFailAudioStreamCreation[];
+ 
+ MEDIA_EXPORT extern const char kVideoThreads[];
+ 
++MEDIA_EXPORT extern const char kDisableMediaSuspend[];
+ MEDIA_EXPORT extern const char kDisableBackgroundMediaSuspend[];
+ 
+ MEDIA_EXPORT extern const char kReportVp9AsAnUnsupportedMimeType[];
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index 9686f673cb..834d639695 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -3230,6 +3230,11 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+   DVLOG(2) << __func__ << "(" << is_suspended << ")";
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kDisableMediaSuspend)) {
++    is_suspended = false;
++  }
++
+   // Do not change the state after an error has occurred.
+   // TODO(sandersd): Update PipelineController to remove the need for this.
+   if (IsNetworkStateError(network_state_))
+-- 
+2.43.0
+
