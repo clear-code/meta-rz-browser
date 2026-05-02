@@ -1,69 +1,79 @@
-From b4707407de3c2809b6d82cb60f725e6c9be2a07e Mon Sep 17 00:00:00 2001
+From 0533f22fc1912ccf8d96278eb3c3f1a37316436e Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Thu, 30 Apr 2026 18:48:29 +0900
-Subject: [PATCH] Add --disable-media-suspend to disable suspend completely
+Subject: [PATCH 18/18] Add --disable-v4l2-media-suspend to keep dmabuf for
+ video preview
 
 Upstream-Status: Inappropriate [oe specific]
 
 Signed-off-by: Takuro Ashie <ashie@clear-code.com>
 ---
- content/browser/renderer_host/render_process_host_impl.cc    | 1 +
- media/base/media_switches.cc                                 | 4 ++++
- media/base/media_switches.h                                  | 1 +
- .../blink/renderer/platform/media/web_media_player_impl.cc   | 5 +++++
- 4 files changed, 11 insertions(+)
+ content/browser/renderer_host/render_process_host_impl.cc | 3 +++
+ media/base/media_switches.cc                              | 6 ++++++
+ media/base/media_switches.h                               | 3 +++
+ .../renderer/platform/media/web_media_player_impl.cc      | 8 ++++++++
+ 4 files changed, 20 insertions(+)
 
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
-index 10a3e987de..2ea1e5c61f 100644
+index 67cdf0f30f..735634a237 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
 +++ b/content/browser/renderer_host/render_process_host_impl.cc
-@@ -3307,6 +3307,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
-       switches::kDisableGpuMemoryBufferVideoFrames,
+@@ -3471,6 +3471,9 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
        switches::kDisableHistogramCustomizer,
        switches::kDisableLCDText,
-+      switches::kDisableMediaSuspend,
        switches::kDisableBackgroundMediaSuspend,
++#if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
++      switches::kDisableV4L2MediaSuspend,
++#endif
        switches::kDisableNotifications,
        switches::kDisableOriginTrialControlledBlinkFeatures,
+       switches::kDisablePresentationAPI,
 diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
-index 7050a1da9f..2f325f4c10 100644
+index 362688daba..27ccd64b24 100644
 --- a/media/base/media_switches.cc
 +++ b/media/base/media_switches.cc
-@@ -51,6 +51,10 @@ const char kFailAudioStreamCreation[] = "fail-audio-stream-creation";
- // Set number of threads to use for video decoding.
- const char kVideoThreads[] = "video-threads";
- 
-+// Never suspend media.
-+const char kDisableMediaSuspend[] =
-+    "disable-media-suspend";
-+
- // Do not immediately suspend media in background tabs.
+@@ -54,6 +54,12 @@ const char kVideoThreads[] = "video-threads";
  const char kDisableBackgroundMediaSuspend[] =
      "disable-background-media-suspend";
+ 
++#if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
++// Never suspend v4l2 decoder to preserve decoded preview image.
++const char kDisableV4L2MediaSuspend[] =
++    "disable-v4l2-media-suspend";
++#endif
++
+ // Force to report VP9 as an unsupported MIME type.
+ const char kReportVp9AsAnUnsupportedMimeType[] =
+     "report-vp9-as-an-unsupported-mime-type";
 diff --git a/media/base/media_switches.h b/media/base/media_switches.h
-index 75dd5b64e8..f90ac145ea 100644
+index d1a6a7e180..8f1f81847d 100644
 --- a/media/base/media_switches.h
 +++ b/media/base/media_switches.h
-@@ -39,6 +39,7 @@ MEDIA_EXPORT extern const char kFailAudioStreamCreation[];
- 
+@@ -39,6 +39,9 @@ MEDIA_EXPORT extern const char kFailAudioStreamCreation[];
  MEDIA_EXPORT extern const char kVideoThreads[];
  
-+MEDIA_EXPORT extern const char kDisableMediaSuspend[];
  MEDIA_EXPORT extern const char kDisableBackgroundMediaSuspend[];
++#if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
++MEDIA_EXPORT extern const char kDisableV4L2MediaSuspend[];
++#endif
  
  MEDIA_EXPORT extern const char kReportVp9AsAnUnsupportedMimeType[];
+ 
 diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
-index 921d37e1da..0d888f0610 100644
+index 9686f673cb..f43e86731c 100644
 --- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
 +++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
-@@ -3214,6 +3214,11 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
+@@ -3230,6 +3230,14 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
    DCHECK(main_task_runner_->BelongsToCurrentThread());
    DVLOG(2) << __func__ << "(" << is_suspended << ")";
  
-+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          switches::kDisableMediaSuspend)) {
++#if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
++  if (video_decoder_type_ == media::VideoDecoderType::kV4L2 &&
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kDisableV4L2MediaSuspend)) {
 +    is_suspended = false;
 +  }
++#endif
 +
    // Do not change the state after an error has occurred.
    // TODO(sandersd): Update PipelineController to remove the need for this.

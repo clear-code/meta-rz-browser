@@ -17,7 +17,7 @@ GN_ARGS:append = " fatal_linker_warnings=false"
 CHROMIUM_EXTRA_ARGS:append = " --render-node-override=\/dev\/dri\/card0 "
 CHROMIUM_EXTRA_ARGS:append = " --in-process-gpu "
 CHROMIUM_EXTRA_ARGS:append = " \
-  ${@bb.utils.contains('PACKAGECONFIG', 'use-v4l2', '--enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL --disable-media-suspend', '', d)} \
+  ${@bb.utils.contains('PACKAGECONFIG', 'use-v4l2', '--enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL --disable-v4l2-media-suspend', '', d)} \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
