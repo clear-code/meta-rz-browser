@@ -1,4 +1,4 @@
-From d0560c2f72e7240991817a5ce4e052b72ef52b7a Mon Sep 17 00:00:00 2001
+From a89a19d0890ca9f112289f0a1ce17c9a487aa417 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Thu, 7 May 2026 13:08:03 +0900
 Subject: [PATCH 19/19] Avoid nullptr file dialogs without native backend

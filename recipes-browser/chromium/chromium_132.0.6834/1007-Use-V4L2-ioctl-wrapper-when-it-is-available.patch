@@ -1,4 +1,4 @@
-From 1c6b58b48656a5b34a61a6a1fc62d7c6d88276f5 Mon Sep 17 00:00:00 2001
+From 223e5913f192b829356a240045ac87281da42f10 Mon Sep 17 00:00:00 2001
 From: Kentaro Hayashi <hayashi@clear-code.com>
 Date: Mon, 14 Jul 2025 11:51:10 +0900
 Subject: [PATCH] Use V4L2 ioctl wrapper when it is available
@@ -9,6 +9,7 @@ It fixes the following error:
   Failed querying caps: Inappropriate ioctl for device (25)
 
 Upstream-Status: Pending
+
 Signed-off-by: Kentaro Hayashi <hayashi@clear-code.com>
 Signed-off-by: Takuro Ashie <ashie@clear-code.com>
 ---
@@ -17,9 +18,9 @@ Signed-off-by: Takuro Ashie <ashie@clear-code.com>
  media/gpu/chromeos/video_decoder_pipeline.cc  |   2 +-
  media/gpu/v4l2/v4l2_queue.cc                  |   2 +-
  media/gpu/v4l2/v4l2_stateful_video_decoder.cc |  45 +++---
- media/gpu/v4l2/v4l2_utils.cc                  | 132 ++++++++++--------
+ media/gpu/v4l2/v4l2_utils.cc                  | 133 ++++++++++--------
  media/gpu/v4l2/v4l2_utils.h                   |  19 +++
- 7 files changed, 117 insertions(+), 89 deletions(-)
+ 7 files changed, 118 insertions(+), 89 deletions(-)
 
 diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
 index d5695e08eb..7050a1da9f 100644
@@ -63,7 +64,7 @@ index 23d3d7e17c..9e818eb9e7 100644
            base::BindOnce(&V4L2StatefulVideoDecoder::Create);
      } else {
 diff --git a/media/gpu/v4l2/v4l2_queue.cc b/media/gpu/v4l2/v4l2_queue.cc
-index be01ce3666..c5f8f62c67 100644
+index 6868efc0d8..96a0ed17a9 100644
 --- a/media/gpu/v4l2/v4l2_queue.cc
 +++ b/media/gpu/v4l2/v4l2_queue.cc
 @@ -254,7 +254,7 @@ V4L2Buffer::~V4L2Buffer() {
@@ -215,7 +216,7 @@ index e5069a3acf..a2727acb5c 100644
      return std::numeric_limits<int>::max();
    }
 diff --git a/media/gpu/v4l2/v4l2_utils.cc b/media/gpu/v4l2/v4l2_utils.cc
-index 2b8ca56143..075effedd9 100644
+index 845c3058ad..6c033395b1 100644
 --- a/media/gpu/v4l2/v4l2_utils.cc
 +++ b/media/gpu/v4l2/v4l2_utils.cc
 @@ -68,16 +68,11 @@ using media_gpu_v4l2::kModuleV4l2;
@@ -236,7 +237,7 @@ index 2b8ca56143..075effedd9 100644
  std::string GetDriverName(const media::IoctlAsCallback& ioctl_cb) {
    struct v4l2_capability caps;
    memset(&caps, 0, sizeof(caps));
-@@ -92,6 +87,66 @@ std::string GetDriverName(const media::IoctlAsCallback& ioctl_cb) {
+@@ -92,6 +87,67 @@ std::string GetDriverName(const media::IoctlAsCallback& ioctl_cb) {
  }  // namespace
  namespace media {
  
@@ -271,7 +272,8 @@ index 2b8ca56143..075effedd9 100644
 +{
 +  if (use_libv4l2_)
 +    v4l2_close(fd);
-+  close(fd);
++  else
++    close(fd);
 +}
 +
 +void* V4L2Mmap(int fd,
@@ -303,7 +305,7 @@ index 2b8ca56143..075effedd9 100644
  void RecordMediaIoctlUMA(MediaIoctlRequests function) {
    base::UmaHistogramEnumeration("Media.V4l2VideoDecoder.MediaIoctlError",
                                  function);
-@@ -609,58 +664,26 @@ struct timeval TimeDeltaToTimeVal(base::TimeDelta time_delta) {
+@@ -604,58 +660,26 @@ struct timeval TimeDeltaToTimeVal(base::TimeDelta time_delta) {
  std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
    SupportedVideoDecoderConfigs supported_media_configs;
    std::vector<std::string> candidate_paths;
@@ -368,7 +370,7 @@ index 2b8ca56143..075effedd9 100644
            &min_coded_size, &max_coded_size);
  
        for (const auto& profile : media_codec_profiles) {
-@@ -675,9 +698,7 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
+@@ -670,9 +694,7 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
        }
      }
  
@@ -379,7 +381,7 @@ index 2b8ca56143..075effedd9 100644
    }
  
  #if DCHECK_IS_ON()
-@@ -692,18 +713,16 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
+@@ -687,18 +709,16 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
  }
  
  bool IsV4L2DecoderStateful() {
@@ -403,7 +405,7 @@ index 2b8ca56143..075effedd9 100644
    // V4L2 stateful formats (don't end up with _SLICE or _FRAME) supported.
    constexpr std::array<uint32_t, 4> kSupportedStatefulInputCodecs = {
        V4L2_PIX_FMT_H264,
-@@ -718,14 +737,9 @@ bool IsV4L2DecoderStateful() {
+@@ -713,14 +733,9 @@ bool IsV4L2DecoderStateful() {
                              kSupportedStatefulInputCodecs.begin(),
                              kSupportedStatefulInputCodecs.end()) !=
           v4l2_codecs.end();
@@ -419,7 +421,7 @@ index 2b8ca56143..075effedd9 100644
        open(kVideoDeviceDriverPath, O_RDWR | O_NONBLOCK | O_CLOEXEC)));
    if (!device_fd.is_valid()) {
 diff --git a/media/gpu/v4l2/v4l2_utils.h b/media/gpu/v4l2/v4l2_utils.h
-index 6a0be7c5c5..4fc3bd8d32 100644
+index a204fc2ed5..77cab27e82 100644
 --- a/media/gpu/v4l2/v4l2_utils.h
 +++ b/media/gpu/v4l2/v4l2_utils.h
 @@ -106,6 +106,25 @@ enum class VidiocIoctlRequests {

@@ -1,4 +1,4 @@
-From 96ba19138f4920e144e7c36d0543f00edac35747 Mon Sep 17 00:00:00 2001
+From b28832f0a5d52f406ab9d953923de7d44c1b33f8 Mon Sep 17 00:00:00 2001
 From: Kentaro Hayashi <hayashi@clear-code.com>
 Date: Mon, 14 Jul 2025 11:51:10 +0900
 Subject: [PATCH 15/19] Use V4L2 ioctl wrapper when it is available
@@ -17,9 +17,9 @@ Signed-off-by: Takuro Ashie <ashie@clear-code.com>
  media/gpu/chromeos/video_decoder_pipeline.cc  |   2 +-
  media/gpu/v4l2/v4l2_queue.cc                  |   2 +-
  media/gpu/v4l2/v4l2_stateful_video_decoder.cc |  45 +++---
- media/gpu/v4l2/v4l2_utils.cc                  | 132 ++++++++++--------
+ media/gpu/v4l2/v4l2_utils.cc                  | 133 ++++++++++--------
  media/gpu/v4l2/v4l2_utils.h                   |  19 +++
- 7 files changed, 117 insertions(+), 89 deletions(-)
+ 7 files changed, 118 insertions(+), 89 deletions(-)
 
 diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
 index 7974b208ee..362688daba 100644
@@ -215,7 +215,7 @@ index fccba4205b..6a364e3645 100644
      return std::numeric_limits<int>::max();
    }
 diff --git a/media/gpu/v4l2/v4l2_utils.cc b/media/gpu/v4l2/v4l2_utils.cc
-index 8fe1820623..7dd011f54a 100644
+index 8fe1820623..428c8304e6 100644
 --- a/media/gpu/v4l2/v4l2_utils.cc
 +++ b/media/gpu/v4l2/v4l2_utils.cc
 @@ -68,16 +68,11 @@ using media_gpu_v4l2::kModuleV4l2;
@@ -236,7 +236,7 @@ index 8fe1820623..7dd011f54a 100644
  std::string GetDriverName(const media::IoctlAsCallback& ioctl_cb) {
    struct v4l2_capability caps;
    memset(&caps, 0, sizeof(caps));
-@@ -92,6 +87,66 @@ std::string GetDriverName(const media::IoctlAsCallback& ioctl_cb) {
+@@ -92,6 +87,67 @@ std::string GetDriverName(const media::IoctlAsCallback& ioctl_cb) {
  }  // namespace
  namespace media {
  
@@ -271,7 +271,8 @@ index 8fe1820623..7dd011f54a 100644
 +{
 +  if (use_libv4l2_)
 +    v4l2_close(fd);
-+  close(fd);
++  else
++    close(fd);
 +}
 +
 +void* V4L2Mmap(int fd,
@@ -303,7 +304,7 @@ index 8fe1820623..7dd011f54a 100644
  void RecordMediaIoctlUMA(MediaIoctlRequests function) {
    base::UmaHistogramEnumeration("Media.V4l2VideoDecoder.MediaIoctlError",
                                  function);
-@@ -603,58 +658,26 @@ struct timeval TimeDeltaToTimeVal(base::TimeDelta time_delta) {
+@@ -603,58 +659,26 @@ struct timeval TimeDeltaToTimeVal(base::TimeDelta time_delta) {
  std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
    SupportedVideoDecoderConfigs supported_media_configs;
    std::vector<std::string> candidate_paths;
@@ -368,7 +369,7 @@ index 8fe1820623..7dd011f54a 100644
            &min_coded_size, &max_coded_size);
  
        for (const auto& profile : media_codec_profiles) {
-@@ -669,9 +692,7 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
+@@ -669,9 +693,7 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
        }
      }
  
@@ -379,7 +380,7 @@ index 8fe1820623..7dd011f54a 100644
    }
  
  #if DCHECK_IS_ON()
-@@ -686,18 +707,16 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
+@@ -686,18 +708,16 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
  }
  
  bool IsV4L2DecoderStateful() {
@@ -403,7 +404,7 @@ index 8fe1820623..7dd011f54a 100644
    // V4L2 stateful formats (don't end up with _SLICE or _FRAME) supported.
    constexpr std::array<uint32_t, 4> kSupportedStatefulInputCodecs = {
        V4L2_PIX_FMT_H264,
-@@ -709,14 +728,9 @@ bool IsV4L2DecoderStateful() {
+@@ -709,14 +729,9 @@ bool IsV4L2DecoderStateful() {
                              kSupportedStatefulInputCodecs.begin(),
                              kSupportedStatefulInputCodecs.end()) !=
           v4l2_codecs.end();

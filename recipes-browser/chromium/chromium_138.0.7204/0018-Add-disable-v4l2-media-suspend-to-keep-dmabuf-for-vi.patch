@@ -1,4 +1,4 @@
-From 0533f22fc1912ccf8d96278eb3c3f1a37316436e Mon Sep 17 00:00:00 2001
+From 946ed9a1225353da316c88d0af61e250d9d09231 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Thu, 30 Apr 2026 18:48:29 +0900
 Subject: [PATCH 18/19] Add --disable-v4l2-media-suspend to keep dmabuf for
