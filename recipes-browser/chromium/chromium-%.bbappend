@@ -22,12 +22,25 @@ CHROMIUM_EXTRA_ARGS:append = " \
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
+SRC_URI:append = " \
+    file://disable_startup_popup.json \
+"
+
+FILES:${PN} += " \
+    /etc/chromium/policies/managed/* \
+"
+
 # Fixup v8_qemu_wrapper library search path for component build
 # see https://github.com/OSSystems/meta-browser/issues/314
 do_configure:append() {
 	WRAPPER=${B}/v8-qemu-wrapper.sh
 	[ -e ${WRAPPER} ] &&
 		sed -i "s#\(LD_LIBRARY_PATH=\)#\1${B}:#" ${WRAPPER}
+}
+
+do_install:append() {
+    install -d ${D}/etc/chromium/policies/managed
+    install -m 0644 ${WORKDIR}/disable_startup_popup.json ${D}/etc/chromium/policies/managed
 }
 
 INSANE_SKIP:${PN} = "already-stripped"
