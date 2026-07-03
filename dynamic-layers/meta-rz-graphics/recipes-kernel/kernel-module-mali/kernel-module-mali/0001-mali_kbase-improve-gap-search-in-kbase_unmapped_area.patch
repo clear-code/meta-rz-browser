@@ -1,0 +1,113 @@
+From f226d491a1472763b1b41fb54816db6bfdf813f8 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Fri, 10 Apr 2026 12:02:41 +0900
+Subject: [PATCH] mali_kbase: improve gap search in
+ kbase_unmapped_area_topdown()
+
+The current implementation updates high_limit after rejecting a gap,
+but restarts maple tree traversal from the root by calling mas_reset()
+on each iteration.
+
+Replace the high_limit-based retry logic with a monotonic search window
+that strictly decreases after each rejected gap to ensure forward
+progress.
+Also keep MA_STATE across iterations to avoid restarting the search
+from the root, improving efficiency under fragmented VA layouts.
+A defensive loop bound and mas_reset() fallback are retained to handle
+unexpected lack of progress.
+
+This issue was observed with Chromium v138, but not with Chromium v132.
+This may be due to increased VA fragmentation caused by mmap() patterns
+in Chromium v138.
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ .../arm/midgard/thirdparty/mali_kbase_mmap.c  | 55 ++++++++++++-------
+ 1 file changed, 36 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c b/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c
+index 90e1e10..b10a213 100644
+--- a/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c
++++ b/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c
+@@ -374,7 +374,9 @@ check_current:
+ 		}
+ 	}
+ #else
+-	unsigned long high_limit, gap_start, gap_end, length;
++	unsigned long gap_start, gap_end, length;
++	unsigned long search_high;
++	unsigned int loop_cnt = 0;
+ 
+ 	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
+ 
+@@ -382,34 +384,49 @@ check_current:
+ 	length = info->length + info->align_mask;
+ 	if (length < info->length)
+ 		return -ENOMEM;
+-	high_limit = info->high_limit;
+-	if ((high_limit - info->low_limit) < length)
++	if (info->high_limit < info->low_limit ||
++	    (info->high_limit - info->low_limit) < length)
+ 		return -ENOMEM;
+ 
+-	while (true) {
+-		unsigned long saved_high_lmt = high_limit;
++	search_high = info->high_limit;
++
++	while (search_high > info->low_limit) {
++		if (unlikely(++loop_cnt > 100000)) {
++			pr_warn("%s: excessive loop detected (low=%lx high=%lx len=%lx)\n",
++				__func__, info->low_limit, info->high_limit, length);
++			return -ENOMEM;
++		}
+ 
+-		if (mas_empty_area_rev(&mas, info->low_limit, info->high_limit - 1, length))
++		if (mas_empty_area_rev(&mas, info->low_limit,
++				      search_high - 1, length))
+ 			return -ENOMEM;
++
+ 		gap_end = mas.last + 1;
+ 		gap_start = mas.index;
+ 
+ 		if (align_and_check(&gap_end, gap_start, info, is_shader_code, is_same_4gb_page))
+ 			return gap_end;
+ 
+-		if (gap_end < info->low_limit)
+-                        return -ENOMEM;
+-		/* Adjust next search high limit */
+-		high_limit = gap_end + length;
+-
+-		if (WARN_ONCE(high_limit >= saved_high_lmt,
+-				"Unexpected recurring high_limit in search, %lx => %lx\n"
+-				"\tinfo-input: limit=[%lx, %lx], mask=%lx, len=%lx\n",
+-				saved_high_lmt, high_limit, info->low_limit, info->high_limit,
+-				info->align_mask, info->length))
+-				high_limit = saved_high_lmt -
+-					(info->align_offset ? info->align_offset : info->length);
+-		mas_reset(&mas);
++		/*
++		 * Ensure forward progress:
++		 * next search range must be strictly below current gap_start
++		 */
++		if (gap_start <= info->low_limit)
++			return -ENOMEM;
++
++		/*
++		 * Move search window downward.
++		 * Do not reset mas, it will continue traversal efficiently.
++		 */
++		search_high = gap_start;
++
++		/*
++		 * If mas does not progress as expected, reinitialize it.
++		 */
++		if (unlikely(mas.index >= search_high)) {
++			pr_debug("%s: mas stalled, resetting cursor\n", __func__);
++			mas_reset(&mas);
++		}
+ 	}
+ #endif
+ 	return -ENOMEM;
+-- 
+2.43.0
+

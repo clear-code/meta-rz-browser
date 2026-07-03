@@ -1,0 +1,112 @@
+From 8663b717294ce5a8d8ee7319da7bab93c931c37d Mon Sep 17 00:00:00 2001
+From: Sang Ngo <sang.ngo.yf@renesas.com>
+Date: Mon, 2 Mar 2026 13:20:17 +0700
+Subject: [PATCH] Avoiding infinite retry on rejected VMA gaps
+
+The search range was not updated after align_and_check() rejects a gap
+found by mas_empty_area_rev(), so it causes infinite loop because the same gap
+is retried indefinitely
+
+This issue is fixed on DDK R54p1
+I ported the fix here
+	+ Updated high_limit after align_and_check() rejects
+	+ Change the way to search gap to lengh + align_mask
+
+Signed-off-by: Sang Ngo <sang.ngo.yf@renesas.com>
+---
+ .../arm/midgard/thirdparty/mali_kbase_mmap.c  | 51 ++++++++++++-------
+ 1 file changed, 33 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c b/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c
+index cfb347a..90e1e10 100644
+--- a/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c
++++ b/drivers/gpu/arm/midgard/thirdparty/mali_kbase_mmap.c
+@@ -196,14 +196,16 @@ static bool align_and_check(unsigned long *gap_end, unsigned long gap_start,
+ 	*gap_end -= (*gap_end - info->align_offset) & info->align_mask;
+ 
+ 	if (is_shader_code) {
++		unsigned long align_adjust = (info->align_offset ? info->align_offset : info->length);
++		unsigned long align_floor = info->low_limit + align_adjust;
++
+ 		/* Check for 4GB boundary */
+-		if (0 == (*gap_end & BASE_MEM_MASK_4GB))
+-			(*gap_end) -= (info->align_offset ? info->align_offset : info->length);
+-		if (0 == ((*gap_end + info->length) & BASE_MEM_MASK_4GB))
+-			(*gap_end) -= (info->align_offset ? info->align_offset : info->length);
++		if ((0 == (*gap_end & BASE_MEM_MASK_4GB)) && *gap_end >= align_floor)
++			(*gap_end) -= align_adjust;
++		if (0 == ((*gap_end + info->length) & BASE_MEM_MASK_4GB) && *gap_end >= align_floor)
++			(*gap_end) -= align_adjust;
+ 
+-		if (!(*gap_end & BASE_MEM_MASK_4GB) ||
+-		    !((*gap_end + info->length) & BASE_MEM_MASK_4GB))
++		if (!((*gap_end & BASE_MEM_MASK_4GB) && ((*gap_end + info->length) & BASE_MEM_MASK_4GB)))
+ 			return false;
+ 	} else if (is_same_4gb_page) {
+ 		unsigned long start = *gap_end;
+@@ -232,7 +234,8 @@ static bool align_and_check(unsigned long *gap_end, unsigned long gap_start,
+ 			 * size of allocation is limited to 4GB and the initial
+ 			 * start location was already aligned.
+ 			 */
+-			WARN_ON((start & mask) != ((end - 1) & mask));
++			if (WARN_ON((start & mask) != ((end - 1) & mask)))
++				return false;
+ 		}
+ 	}
+ 
+@@ -371,30 +374,42 @@ check_current:
+ 		}
+ 	}
+ #else
+-	unsigned long high_limit, gap_start, gap_end;
++	unsigned long high_limit, gap_start, gap_end, length;
+ 
+ 	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
+ 
+-	/*
+-	 * Adjust search limits by the desired length.
+-	 * See implementation comment at top of unmapped_area().
+-	 */
+-	gap_end = info->high_limit;
+-	if (gap_end < info->length)
++	/* Adjust search length to account for worst case alignment overhead */
++	length = info->length + info->align_mask;
++	if (length < info->length)
+ 		return -ENOMEM;
+-	high_limit = gap_end - info->length;
+-
+-	if (info->low_limit > high_limit)
++	high_limit = info->high_limit;
++	if ((high_limit - info->low_limit) < length)
+ 		return -ENOMEM;
+ 
+ 	while (true) {
+-		if (mas_empty_area_rev(&mas, info->low_limit, info->high_limit - 1, info->length))
++		unsigned long saved_high_lmt = high_limit;
++
++		if (mas_empty_area_rev(&mas, info->low_limit, info->high_limit - 1, length))
+ 			return -ENOMEM;
+ 		gap_end = mas.last + 1;
+ 		gap_start = mas.index;
+ 
+ 		if (align_and_check(&gap_end, gap_start, info, is_shader_code, is_same_4gb_page))
+ 			return gap_end;
++
++		if (gap_end < info->low_limit)
++                        return -ENOMEM;
++		/* Adjust next search high limit */
++		high_limit = gap_end + length;
++
++		if (WARN_ONCE(high_limit >= saved_high_lmt,
++				"Unexpected recurring high_limit in search, %lx => %lx\n"
++				"\tinfo-input: limit=[%lx, %lx], mask=%lx, len=%lx\n",
++				saved_high_lmt, high_limit, info->low_limit, info->high_limit,
++				info->align_mask, info->length))
++				high_limit = saved_high_lmt -
++					(info->align_offset ? info->align_offset : info->length);
++		mas_reset(&mas);
+ 	}
+ #endif
+ 	return -ENOMEM;
+-- 
+2.25.1
