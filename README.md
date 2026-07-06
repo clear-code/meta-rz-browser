@@ -15,7 +15,7 @@ Building
    e.g.)
    ```console
    $ bitbake-layers add-layer ../meta-rz-features/meta-rz-codecs
-   $ bitbake-layers add-layer ../meta-browser-hwdecode
+   $ bitbake-layers add-layer ../meta-rz-browser
    ```
 2. Build as usual  
    e.g.)
