@@ -1,52 +1,79 @@
-Overview
-========
+# Overview
 
-This layer enables hardware assisted video decoding in Chromium via the Chromium
-V4L2VideoDecoder + V4L2VideoDecoderBackendStateful, using the
-[v4l-gst libv4l plugin](https://github.com/clear-code/v4l-gst) to connect it to
-the H/W video decoder of Renesas RZ/G series available through GStreamer.
+This layer provides browser integration for Renesas RZ/G platforms.
 
-Currently, only H.264 & H.265 video codec are supported.
+It extends the vendor BSP with packages, configuration, and workarounds
+required to build and run a modern web browser environment. The current
+implementation is based on Chromium, but the layer is intended to provide
+general browser integration rather than being Chromium-specific.
 
-Building
-========
+The layer includes:
 
-1. Add this layer & meta-rz-codecs layer to your `bblayers.conf` file  
-   e.g.)
-   ```console
-   $ bitbake-layers add-layer ../meta-rz-features/meta-rz-codecs
-   $ bitbake-layers add-layer ../meta-rz-browser
-   ```
-2. Build as usual  
-   e.g.)
-   ```console
-   $ bitbake chromium-ozone-wayland
-   ```
+* Browser package groups for RZ/G platforms
+* Browser runtime packages and configuration
+* Browser-specific BSP workarounds when required
+* Hardware-assisted video decoding support using the Chromium V4L2 video
+  decoder and the v4l-gst bridge
 
-Configuration
-=============
+Currently, hardware-assisted video decoding supports H.264 and H.265 through
+GStreamer-based vendor decoders.
 
-The settings file for the v4l-gst bridge is located at `/etc/xdg/libv4l-gst.conf`.
-This file allows for specifying the GStreamer pipeline that the plugin will
-attempt to use to decode the video frames that it receives from the V4L2
-interface.
+# Building
 
-e.g.)
-```ini
-[libv4l-gst]
-min-buffers=2
+Assuming the Renesas BSP has already been set up, clone the required layers.
 
-[H264]
-pipeline=h264parse ! omxh264dec
+The Chromium recipe depends on external layers such as `meta-clang` and
+`meta-lts-mixins`. Since Chromium is sensitive to layer revisions, we recommend
+using the tested revision combination below.
 
-[HEVC]
-pipeline=h265parse ! omxh265dec
+## Supported layer combination
+
+```console
+$ (git clone https://github.com/kraj/meta-clang.git && \
+   cd meta-clang && \
+   git checkout eea5ec23155cfd47781599fdc9a92c21e4caffc8)
+$ (git clone https://git.yoctoproject.org/meta-lts-mixins && \
+   cd meta-lts-mixins && \
+   git checkout a8046d5ec53b1856169ac795aa87cb0d5db84c04)
+$ git clone --branch rzg-scarthgap/chromium132-20260508 --single-branch \
+  https://github.com/clear-code/meta-browser.git
+$ git clone \
+  https://github.com/clear-code/meta-rz-browser.git
 ```
 
-Running with Chromium
-=====================
-
-Run as usual:
+Then initialize the build environment:
 ```console
-$ chromium file:///path/to/some/h264-video.html
+$ source poky/oe-init-build-env
+$ bitbake-layers add-layer ../meta-clang
+$ bitbake-layers add-layer ../meta-lts-mixins
+$ bitbake-layers add-layer ../meta-browser/meta-chromium
+$ bitbake-layers add-layer ../meta-rz-browser
+```
+
+Build the image:
+```console
+$ MACHINE=<your-machine> bitbake core-image-weston
+```
+
+The layer automatically extends the vendor BSP through dynamic layers when the
+corresponding RZ/G layers are present.
+
+# Running
+
+Build and boot the generated image as usual.
+
+Chromium can be started normally, for example:
+
+```console
+$ chromium
+```
+
+Hardware-assisted video decoding is enabled automatically when the required
+multimedia components are available.
+
+If you want to launch Chromium as the root user (e.g. via serial console), you
+need the `--no-sandbox` option:
+
+```console
+# chromium --no-sandbox
 ```
