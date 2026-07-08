@@ -8,7 +8,7 @@ inherit auto-patch
 
 PACKAGECONFIG ??= "use-egl ${@bb.utils.contains('COMBINED_FEATURES', 'hwh264dec', 'use-v4l2 proprietary-codecs', '', d)}"
 PACKAGECONFIG[use-v4l2] = "use_v4l2_codec=true use_v4lplugin=true"
-PACKAGECONFIG[disable-startup-dialogs] = ",,,"
+PACKAGECONFIG[embedded-policy] = ",,,"
 
 RDEPENDS:${PN} += "${@bb.utils.contains('PACKAGECONFIG', 'use-v4l2', 'v4l-gst', '', d)}"
 
@@ -24,7 +24,7 @@ CHROMIUM_EXTRA_ARGS:append = " \
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 SRC_URI:append = " \
-    ${@bb.utils.contains('PACKAGECONFIG', 'disable-startup-dialogs', 'file://disable_startup_dialogs.json', '', d)} \
+    ${@bb.utils.contains('PACKAGECONFIG', 'embedded_policy', 'file://embedded_policy.json', '', d)} \
 "
 
 FILES:${PN} += " \
@@ -39,9 +39,9 @@ do_configure:append() {
 }
 
 do_install:append() {
-    if ${@bb.utils.contains('PACKAGECONFIG', 'disable-startup-dialogs', 'true', 'false', d)}; then
+    if ${@bb.utils.contains('PACKAGECONFIG', 'embedded-policy', 'true', 'false', d)}; then
         install -d ${D}/etc/chromium/policies/managed
-        install -m 0644 ${WORKDIR}/disable_startup_dialogs.json ${D}/etc/chromium/policies/managed/
+        install -m 0644 ${WORKDIR}/embedded_policy.json ${D}/etc/chromium/policies/managed/
     fi
 }
 
