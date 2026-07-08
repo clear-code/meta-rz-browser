@@ -1,0 +1,100 @@
+#!/bin/sh
+#
+# Copyright (C) 2026 ClearCode Inc.
+# SPDX-License-Identifier: MIT
+
+set -eu
+
+content_dir="/usr/share/gem-tanzanite"
+host="127.0.0.1"
+runtime_dir="${XDG_RUNTIME_DIR:-}"
+if [ -z "${runtime_dir}" ] || [ ! -d "${runtime_dir}" ] || [ ! -w "${runtime_dir}" ]; then
+    runtime_dir="/tmp/gem-tanzanite-$(id -u)"
+    mkdir -p "${runtime_dir}"
+    chmod 700 "${runtime_dir}"
+fi
+pid_file="${runtime_dir}/gem-tanzanite-httpd.pid"
+port_file="${runtime_dir}/gem-tanzanite-httpd.port"
+log_file="${runtime_dir}/gem-tanzanite-httpd.log"
+chromium_args="--kiosk"
+if [ "$(id -u)" -eq 0 ]; then
+    chromium_args="${chromium_args} --no-sandbox"
+fi
+
+find_chromium() {
+    for command in chromium chromium-browser; do
+        if command -v "${command}" >/dev/null 2>&1; then
+            command -v "${command}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+is_running() {
+    [ -s "${pid_file}" ] || return 1
+    [ -s "${port_file}" ] || return 1
+    kill -0 "$(cat "${pid_file}")" >/dev/null 2>&1 || return 1
+    server_is_ready
+}
+
+server_is_ready() {
+    python3 -c 'import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+s.connect((sys.argv[1], int(sys.argv[2])))
+s.close()' "${host}" "$(cat "${port_file}")" >/dev/null 2>&1
+}
+
+start_server() {
+    if is_running; then
+        return 0
+    fi
+
+    rm -f "${pid_file}" "${port_file}"
+    python3 -u -c 'import functools, http.server, os, sys
+host, content_dir, port_file = sys.argv[1:4]
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=content_dir)
+server = http.server.ThreadingHTTPServer((host, 0), handler)
+port = server.server_address[1]
+with open(port_file, "w") as f:
+    f.write(str(port))
+    f.flush()
+os.chmod(port_file, 0o600)
+server.serve_forever()' "${host}" "${content_dir}" "${port_file}" >"${log_file}" 2>&1 &
+    server_pid="$!"
+    echo "${server_pid}" >"${pid_file}"
+
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -s "${port_file}" ] && server_is_ready; then
+            return 0
+        fi
+
+        if ! kill -0 "${server_pid}" >/dev/null 2>&1; then
+            echo "Failed to start gem-tanzanite web server. See ${log_file}." >&2
+            rm -f "${pid_file}" "${port_file}"
+            return 1
+        fi
+
+        sleep 1
+    done
+
+    echo "Timed out waiting for gem-tanzanite web server. See ${log_file}." >&2
+    rm -f "${pid_file}" "${port_file}"
+    return 1
+}
+
+if [ ! -d "${content_dir}" ]; then
+    echo "Content directory not found: ${content_dir}" >&2
+    exit 1
+fi
+
+chromium="$(find_chromium)" || {
+    echo "Chromium executable not found." >&2
+    exit 1
+}
+
+start_server
+url="http://${host}:$(cat "${port_file}")/"
+exec "${chromium}" ${chromium_args} "$@" "${url}"
