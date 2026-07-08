@@ -8,7 +8,6 @@ inherit auto-patch
 
 PACKAGECONFIG ??= "use-egl ${@bb.utils.contains('COMBINED_FEATURES', 'hwh264dec', 'use-v4l2 proprietary-codecs', '', d)}"
 PACKAGECONFIG[use-v4l2] = "use_v4l2_codec=true use_v4lplugin=true"
-PACKAGECONFIG[embedded-policy] = ",,,"
 
 RDEPENDS:${PN} += "${@bb.utils.contains('PACKAGECONFIG', 'use-v4l2', 'v4l-gst', '', d)}"
 
@@ -21,28 +20,11 @@ CHROMIUM_EXTRA_ARGS:append = " \
   ${@bb.utils.contains('PACKAGECONFIG', 'use-v4l2', '--enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL --disable-v4l2-media-suspend', '', d)} \
 "
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
-
-SRC_URI:append = " \
-    ${@bb.utils.contains('PACKAGECONFIG', 'embedded_policy', 'file://embedded_policy.json', '', d)} \
-"
-
-FILES:${PN} += " \
-    /etc/chromium/policies/managed/* \
-"
-
 # Fixup v8_qemu_wrapper library search path for component build
 # see https://github.com/OSSystems/meta-browser/issues/314
 do_configure:append() {
     WRAPPER=${B}/v8-qemu-wrapper.sh
     [ -e ${WRAPPER} ] && sed -i "s#\(LD_LIBRARY_PATH=\)#\1${B}:#" ${WRAPPER}
-}
-
-do_install:append() {
-    if ${@bb.utils.contains('PACKAGECONFIG', 'embedded-policy', 'true', 'false', d)}; then
-        install -d ${D}/etc/chromium/policies/managed
-        install -m 0644 ${WORKDIR}/embedded_policy.json ${D}/etc/chromium/policies/managed/
-    fi
 }
 
 INSANE_SKIP:${PN} = "already-stripped"

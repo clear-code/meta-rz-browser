@@ -15,5 +15,6 @@ PACKAGES = "\
 
 RDEPENDS:${PN} = "\
 	chromium-ozone-wayland \
+	chromiumpolicy \
 	adwaita-icon-theme-cursors \
 "

@@ -87,7 +87,7 @@ To restore the default Chromium behavior, add the following to your
 `conf/local.conf`:
 
 ```conf
-PACKAGECONFIG:remove:pn-chromium-ozone-wayland = "embedded-policy"
+RDEPENDS:packagegroup-rz-browser:remove = "chromiumpolicy"
 ```
 
 # License
