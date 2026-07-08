@@ -1,3 +1,6 @@
+# Copyright (C) 2026 ClearCode Inc.
+# SPDX-License-Identifier: MIT
+
 SUMMARY = "Recommended CJK fonts for web browsers on Renesas RZ platforms"
 DESCRIPTION = " \
   Installs Source Han Sans fonts for Simplified Chinese, Traditional Chinese, \

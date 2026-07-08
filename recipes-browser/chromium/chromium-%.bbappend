@@ -1,6 +1,6 @@
 # Copyright (C) 2019, Fuzhou Rockchip Electronics Co., Ltd
 # Copyright (C) 2024-2026, ClearCode Inc.
-# Released under the MIT license (see COPYING.MIT for the terms)
+# SPDX-License-Identifier: MIT
 
 MAJ_VER = "${@oe.utils.trim_version("${PV}", 3)}"
 PATCHPATH = "${CURDIR}/chromium_${MAJ_VER}"

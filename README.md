@@ -89,3 +89,14 @@ To restore the default Chromium behavior, add the following to your
 ```conf
 PACKAGECONFIG:remove:pn-chromium-ozone-wayland = "disable-startup-dialogs"
 ```
+
+# License
+
+Unless otherwise noted, this repository is licensed under the MIT License.
+
+Files with separate copyright or license notices are governed by those notices.
+Patch files may be governed by the license of the upstream project to which they
+apply.
+
+New code and documentation added by ClearCode Inc. are Copyright (C) 2024-2026
+ClearCode Inc. and licensed under the MIT License.

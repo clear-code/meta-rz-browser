@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 SRC_URI += " \
            file://0001-appsrc-Clear-EOS-on-flush.patch \
           "
