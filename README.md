@@ -77,3 +77,15 @@ need the `--no-sandbox` option:
 ```console
 # chromium --no-sandbox
 ```
+
+By default, this layer installs a Chromium managed policy file that suppresses
+startup dialogs commonly undesirable in embedded environments, including the
+command-line flag security warning shown when the `--no-sandbox` is used and the
+browser sign-in prompt.
+
+To restore the default Chromium behavior, add the following to your
+`conf/local.conf`:
+
+```conf
+PACKAGECONFIG:remove:pn-chromium-ozone-wayland = "disable-startup-dialogs"
+```
