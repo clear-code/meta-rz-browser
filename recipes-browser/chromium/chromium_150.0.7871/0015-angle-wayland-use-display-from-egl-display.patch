@@ -1,0 +1,99 @@
+From 00c5b07371277dbd371ce2080f83a40bd81d6292 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Tue, 1 Sep 2026 14:43:18 +0900
+Subject: [PATCH] angle: Use the EGL display for Vulkan Wayland surfaces
+
+The Wayland headers available in scarthgap do not provide
+wl_proxy_get_display(). Pass the display already owned by DisplayVkWayland
+to the window surface instead.
+
+Upstream-Status: Inappropriate [OE-specific]
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ .../vulkan/linux/wayland/DisplayVkWayland.cpp         |  2 +-
+ .../vulkan/linux/wayland/WindowSurfaceVkWayland.cpp   | 11 +++++------
+ .../vulkan/linux/wayland/WindowSurfaceVkWayland.h     |  5 ++++-
+ 3 files changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
+index 94dc44da7a..a53475fe64 100644
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
+@@ -84,7 +84,7 @@ bool DisplayVkWayland::isValidNativeWindow(EGLNativeWindowType window) const
+ SurfaceImpl *DisplayVkWayland::createWindowSurfaceVk(const egl::SurfaceState &state,
+                                                      EGLNativeWindowType window)
+ {
+-    return new WindowSurfaceVkWayland(state, window);
++    return new WindowSurfaceVkWayland(state, window, mWaylandDisplay);
+ }
+ 
+ egl::ConfigSet DisplayVkWayland::generateConfigs()
+diff --git a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp
+index 7a2804c0f5..ed323546d1 100644
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp
+@@ -26,8 +26,9 @@ void WindowSurfaceVkWayland::ResizeCallback(wl_egl_window *eglWindow, void *payl
+ }
+ 
+ WindowSurfaceVkWayland::WindowSurfaceVkWayland(const egl::SurfaceState &surfaceState,
+-                                               EGLNativeWindowType window)
+-    : WindowSurfaceVk(surfaceState, window)
++                                               EGLNativeWindowType window,
++                                               wl_display *display)
++    : WindowSurfaceVk(surfaceState, window), mDisplay(display)
+ {
+     wl_egl_window *eglWindow   = reinterpret_cast<wl_egl_window *>(window);
+     eglWindow->resize_callback = WindowSurfaceVkWayland::ResizeCallback;
+@@ -45,20 +46,18 @@ angle::Result WindowSurfaceVkWayland::createSurfaceVk(vk::ErrorContext *context)
+     // which asserts proxy->display == queue->display. Derive the display
+     // from the surface so this holds structurally regardless of how the EGL
+     // display was initialized.
+-    wl_display *surfaceDisplay = static_cast<wl_display *>(
+-        wl_proxy_get_display(reinterpret_cast<wl_proxy *>(eglWindow->surface)));
+ 
+     ANGLE_VK_CHECK(context,
+                    vkGetPhysicalDeviceWaylandPresentationSupportKHR(
+                        context->getRenderer()->getPhysicalDevice(),
+-                       context->getRenderer()->getQueueFamilyIndex(), surfaceDisplay),
++                       context->getRenderer()->getQueueFamilyIndex(), mDisplay),
+                    VK_ERROR_INITIALIZATION_FAILED);
+ 
+     VkWaylandSurfaceCreateInfoKHR createInfo = {};
+ 
+     createInfo.sType   = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+     createInfo.flags   = 0;
+-    createInfo.display = surfaceDisplay;
++    createInfo.display = mDisplay;
+     createInfo.surface = eglWindow->surface;
+     ANGLE_VK_TRY(context, vkCreateWaylandSurfaceKHR(context->getRenderer()->getInstance(),
+                                                     &createInfo, nullptr, &mSurface));
+diff --git a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h
+index 77d2f0e129..b4e97bab0f 100644
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h
+@@ -12,6 +12,7 @@
+ 
+ #include "libANGLE/renderer/vulkan/SurfaceVk.h"
+ 
++struct wl_display;
+ struct wl_egl_window;
+ 
+ namespace rx
+@@ -27,7 +28,8 @@ class WindowSurfaceVkWayland : public WindowSurfaceVk
+     // The wl_display for the Vulkan surface is derived from the wl_surface
+     // proxy inside createSurfaceVk (wl_proxy_set_queue requires proxy and
+     // queue to share a connection); no display argument is needed.
+-    WindowSurfaceVkWayland(const egl::SurfaceState &surfaceState, EGLNativeWindowType window);
++    WindowSurfaceVkWayland(const egl::SurfaceState &surfaceState, EGLNativeWindowType window,
++                           wl_display *display);
+ 
+   private:
+     angle::Result createSurfaceVk(vk::ErrorContext *context) override;
+@@ -35,6 +37,7 @@ class WindowSurfaceVkWayland : public WindowSurfaceVk
+                                        gl::Extents *extentsOut) const override;
+ 
+     gl::Extents mExtents;
++    wl_display *mDisplay;
+ };
+ 
+ }  // namespace rx
