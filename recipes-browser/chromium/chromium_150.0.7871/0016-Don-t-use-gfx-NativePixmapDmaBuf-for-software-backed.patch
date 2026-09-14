@@ -1,0 +1,34 @@
+From 77159c558c6ec07f43cb8e36a822546f5927bf94 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 26 Nov 2025 08:33:44 +0900
+Subject: [PATCH 16/22] Don't use gfx::NativePixmapDmaBuf for software backed
+ video frames
+
+For Chromium 150, apply this change to the renamed
+mappable_shared_image_video_frame_pool.cc.
+
+Upstream-Status: Pending
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ media/video/mappable_shared_image_video_frame_pool.cc | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/media/video/mappable_shared_image_video_frame_pool.cc b/media/video/mappable_shared_image_video_frame_pool.cc
+index d242a3c7b5..24ca761256 100644
+--- a/media/video/mappable_shared_image_video_frame_pool.cc
++++ b/media/video/mappable_shared_image_video_frame_pool.cc
+@@ -694,6 +694,10 @@ void MappableSharedImageVideoFramePool::PoolImpl::CreateHardwareFrame(
+ #endif
+ 
+   bool passthrough = false;
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++  if (is_software_backed_video_frame)
++    passthrough = true;
++#endif
+ #if BUILDFLAG(IS_APPLE)
+   if (!IOSurfaceCanSetColorSpace(video_frame->ColorSpace())) {
+     passthrough = true;
+-- 
+2.43.0
+
