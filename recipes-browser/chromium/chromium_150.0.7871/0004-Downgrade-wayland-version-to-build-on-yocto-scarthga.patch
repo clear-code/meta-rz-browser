@@ -1,4 +1,4 @@
-From 9101a4b38c921b9eca9f54bbff6e99b68d2dd248 Mon Sep 17 00:00:00 2001
+From fe393a98791068b80e12e43a162f14d76443ba90 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Tue, 1 Jul 2025 15:38:25 +0900
 Subject: [PATCH 04/22] Downgrade wayland version to build on yocto scarthgap
@@ -6,11 +6,98 @@ Subject: [PATCH 04/22] Downgrade wayland version to build on yocto scarthgap
 It assumes that use with use_system_libwayland=true.
 
 Upstream-Status: Inappropriate [oe specific]
----
- third_party/wayland/wayland_version.gni            |  4 ++--
- ui/ozone/platform/wayland/host/wayland_keyboard.cc | 10 ++++++++--
- 2 files changed, 10 insertions(+), 4 deletions(-)
 
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ .../vulkan/linux/wayland/DisplayVkWayland.cpp         |  2 +-
+ .../vulkan/linux/wayland/WindowSurfaceVkWayland.cpp   | 11 +++++------
+ .../vulkan/linux/wayland/WindowSurfaceVkWayland.h     |  5 ++++-
+ third_party/wayland/wayland_version.gni               |  4 ++--
+ ui/ozone/platform/wayland/host/wayland_keyboard.cc    | 10 ++++++++--
+ 5 files changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
+index 94dc44da7a..a53475fe64 100644
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
+@@ -84,7 +84,7 @@ bool DisplayVkWayland::isValidNativeWindow(EGLNativeWindowType window) const
+ SurfaceImpl *DisplayVkWayland::createWindowSurfaceVk(const egl::SurfaceState &state,
+                                                      EGLNativeWindowType window)
+ {
+-    return new WindowSurfaceVkWayland(state, window);
++    return new WindowSurfaceVkWayland(state, window, mWaylandDisplay);
+ }
+ 
+ egl::ConfigSet DisplayVkWayland::generateConfigs()
+diff --git a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp
+index 7a2804c0f5..ed323546d1 100644
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.cpp
+@@ -26,8 +26,9 @@ void WindowSurfaceVkWayland::ResizeCallback(wl_egl_window *eglWindow, void *payl
+ }
+ 
+ WindowSurfaceVkWayland::WindowSurfaceVkWayland(const egl::SurfaceState &surfaceState,
+-                                               EGLNativeWindowType window)
+-    : WindowSurfaceVk(surfaceState, window)
++                                               EGLNativeWindowType window,
++                                               wl_display *display)
++    : WindowSurfaceVk(surfaceState, window), mDisplay(display)
+ {
+     wl_egl_window *eglWindow   = reinterpret_cast<wl_egl_window *>(window);
+     eglWindow->resize_callback = WindowSurfaceVkWayland::ResizeCallback;
+@@ -45,20 +46,18 @@ angle::Result WindowSurfaceVkWayland::createSurfaceVk(vk::ErrorContext *context)
+     // which asserts proxy->display == queue->display. Derive the display
+     // from the surface so this holds structurally regardless of how the EGL
+     // display was initialized.
+-    wl_display *surfaceDisplay = static_cast<wl_display *>(
+-        wl_proxy_get_display(reinterpret_cast<wl_proxy *>(eglWindow->surface)));
+ 
+     ANGLE_VK_CHECK(context,
+                    vkGetPhysicalDeviceWaylandPresentationSupportKHR(
+                        context->getRenderer()->getPhysicalDevice(),
+-                       context->getRenderer()->getQueueFamilyIndex(), surfaceDisplay),
++                       context->getRenderer()->getQueueFamilyIndex(), mDisplay),
+                    VK_ERROR_INITIALIZATION_FAILED);
+ 
+     VkWaylandSurfaceCreateInfoKHR createInfo = {};
+ 
+     createInfo.sType   = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+     createInfo.flags   = 0;
+-    createInfo.display = surfaceDisplay;
++    createInfo.display = mDisplay;
+     createInfo.surface = eglWindow->surface;
+     ANGLE_VK_TRY(context, vkCreateWaylandSurfaceKHR(context->getRenderer()->getInstance(),
+                                                     &createInfo, nullptr, &mSurface));
+diff --git a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h
+index 77d2f0e129..b4e97bab0f 100644
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/wayland/WindowSurfaceVkWayland.h
+@@ -12,6 +12,7 @@
+ 
+ #include "libANGLE/renderer/vulkan/SurfaceVk.h"
+ 
++struct wl_display;
+ struct wl_egl_window;
+ 
+ namespace rx
+@@ -27,7 +28,8 @@ class WindowSurfaceVkWayland : public WindowSurfaceVk
+     // The wl_display for the Vulkan surface is derived from the wl_surface
+     // proxy inside createSurfaceVk (wl_proxy_set_queue requires proxy and
+     // queue to share a connection); no display argument is needed.
+-    WindowSurfaceVkWayland(const egl::SurfaceState &surfaceState, EGLNativeWindowType window);
++    WindowSurfaceVkWayland(const egl::SurfaceState &surfaceState, EGLNativeWindowType window,
++                           wl_display *display);
+ 
+   private:
+     angle::Result createSurfaceVk(vk::ErrorContext *context) override;
+@@ -35,6 +37,7 @@ class WindowSurfaceVkWayland : public WindowSurfaceVk
+                                        gl::Extents *extentsOut) const override;
+ 
+     gl::Extents mExtents;
++    wl_display *mDisplay;
+ };
+ 
+ }  // namespace rx
 diff --git a/third_party/wayland/wayland_version.gni b/third_party/wayland/wayland_version.gni
 index 3789339c36..6f9f32fa66 100644
 --- a/third_party/wayland/wayland_version.gni
@@ -24,10 +111,10 @@ index 3789339c36..6f9f32fa66 100644
 +wayland_version = "1.22.0"
 +wayland_egl_version = "1.0.0"
 diff --git a/ui/ozone/platform/wayland/host/wayland_keyboard.cc b/ui/ozone/platform/wayland/host/wayland_keyboard.cc
-index 3726dd2d27..22304479dd 100644
+index e091a74336..0485885c5e 100644
 --- a/ui/ozone/platform/wayland/host/wayland_keyboard.cc
 +++ b/ui/ozone/platform/wayland/host/wayland_keyboard.cc
-@@ -43,6 +43,12 @@ namespace ui {
+@@ -44,6 +44,12 @@ namespace ui {
  
  namespace {
  
@@ -40,7 +127,7 @@ index 3726dd2d27..22304479dd 100644
  bool IsModifierKey(int key) {
    auto dom_code = KeycodeConverter::EvdevCodeToDomCode(key);
    switch (dom_code) {
-@@ -398,7 +404,7 @@ void WaylandKeyboard::ProcessKey(uint32_t serial,
+@@ -400,7 +406,7 @@ void WaylandKeyboard::ProcessKey(uint32_t serial,
                                   KeyEventKind kind) {
    // If we receive a Repeat event while repeat info != 0,
    // we shouldn't dispatch it.
@@ -49,7 +136,7 @@ index 3726dd2d27..22304479dd 100644
        auto_repeat_handler_.IsAutoRepeatEnabled()) {
      LOG(WARNING) << "Received key repeat event while repeat rate is non-zero";
      return;
-@@ -427,7 +433,7 @@ void WaylandKeyboard::ProcessKey(uint32_t serial,
+@@ -429,7 +435,7 @@ void WaylandKeyboard::ProcessKey(uint32_t serial,
    }
  
    DispatchKey(key, 0 /*scan_code*/, down,

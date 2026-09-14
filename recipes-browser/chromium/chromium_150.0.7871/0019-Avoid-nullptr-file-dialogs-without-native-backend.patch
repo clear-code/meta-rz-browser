@@ -1,0 +1,164 @@
+From 6658833bce75ac1b7f78c5a0d4967f9dd187b51e Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Thu, 7 May 2026 13:08:03 +0900
+Subject: [PATCH 19/22] Avoid nullptr file dialogs without native backend
+
+Adapt to Chromium 150's simplified dialog selection: retain the portal
+backend when DBus is enabled, honor the explicit headless modes first,
+and use auto-cancel when no native toolkit dialog is available.
+
+Upstream-Status: Inappropriate [oe specific]
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ ui/shell_dialogs/shell_dialog_linux.cc | 114 ++++++++++++++++++++++++-
+ 1 file changed, 111 insertions(+), 3 deletions(-)
+
+diff --git a/ui/shell_dialogs/shell_dialog_linux.cc b/ui/shell_dialogs/shell_dialog_linux.cc
+index 154651427f..327c6fd4c9 100644
+--- a/ui/shell_dialogs/shell_dialog_linux.cc
++++ b/ui/shell_dialogs/shell_dialog_linux.cc
+@@ -2,11 +2,16 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "base/notreached.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "build/config/linux/dbus/buildflags.h"
+ #include "ui/linux/linux_ui.h"
+ #include "ui/shell_dialogs/select_file_dialog_linux.h"
+ #include "ui/shell_dialogs/select_file_policy.h"
++#include "ui/shell_dialogs/selected_file_info.h"
+ 
+ #if BUILDFLAG(USE_DBUS)
+ #include "ui/shell_dialogs/select_file_dialog_linux_portal.h"
+@@ -14,17 +19,120 @@
+ 
+ namespace ui {
+ 
++namespace {
++
++namespace switches {
++inline constexpr char kFileDialogMode[] = "file-dialog-mode";
++inline constexpr char kFileDialogModeAutoCancel[] = "auto-cancel";
++inline constexpr char kFileDialogModeAutoAccept[] = "auto-accept";
++}
++
++class HeadlessSelectFileDialog : public SelectFileDialog {
++ public:
++  HeadlessSelectFileDialog(Listener* listener,
++                           std::unique_ptr<SelectFilePolicy> policy,
++                           const std::string& mode)
++      : SelectFileDialog(listener, std::move(policy)),
++        mode_(mode) {}
++
++  bool IsRunning(gfx::NativeWindow owning_window) const override {
++    return false;
++  }
++  void ListenerDestroyed() override {
++    listener_ = nullptr;
++  }
++
++ protected:
++  void SelectFileImpl(
++      Type type,
++      const std::u16string& title,
++      const base::FilePath& default_path,
++      const FileTypeInfo* file_types,
++      int file_type_index,
++      const base::FilePath::StringType& default_extension,
++      gfx::NativeWindow owning_window,
++      const GURL* caller) override {
++    selected_path_ = default_path;
++    file_type_index_ = file_type_index;
++
++    VLOG(1) << "HeadlessSelectFileDialog:"
++            << " mode=" << mode_
++            << " type=" << type
++            << " path=" << default_path.value();
++
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&HeadlessSelectFileDialog::AutoTask,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  std::string mode_;
++  base::FilePath selected_path_;
++  int file_type_index_ = 0;
++  base::WeakPtrFactory<HeadlessSelectFileDialog> weak_factory_{this};
++
++ private:
++  bool HasMultipleFileTypeChoicesImpl() override {
++    return false;
++  }
++  virtual void AutoTask() = 0;
++};
++
++class AutoCancelSelectFileDialog : public HeadlessSelectFileDialog {
++ public:
++  AutoCancelSelectFileDialog(Listener* listener,
++                             std::unique_ptr<SelectFilePolicy> policy)
++      : HeadlessSelectFileDialog(listener, std::move(policy),
++                                 switches::kFileDialogModeAutoCancel) {}
++ private:
++  void AutoTask() override {
++    if (listener_)
++      listener_->FileSelectionCanceled();
++  }
++};
++
++class AutoAcceptSelectFileDialog : public HeadlessSelectFileDialog {
++ public:
++  AutoAcceptSelectFileDialog(Listener* listener,
++                             std::unique_ptr<SelectFilePolicy> policy)
++      : HeadlessSelectFileDialog(listener, std::move(policy),
++                                 switches::kFileDialogModeAutoAccept) {}
++ private:
++  void AutoTask() override {
++    if (!listener_)
++      return;
++    if (selected_path_.empty())
++      listener_->FileSelectionCanceled();
++    else
++      listener_->FileSelected(ui::SelectedFileInfo(selected_path_),
++                              file_type_index_);
++  }
++};
++
++}  // namespace
++
++
+ SelectFileDialog* CreateSelectFileDialog(
+     SelectFileDialog::Listener* listener,
+     std::unique_ptr<SelectFilePolicy> policy) {
++  auto* command_line = base::CommandLine::ForCurrentProcess();
++  auto mode = command_line->GetSwitchValueASCII(switches::kFileDialogMode);
++  if (mode == switches::kFileDialogModeAutoCancel)
++    return new AutoCancelSelectFileDialog(listener, std::move(policy));
++  if (mode == switches::kFileDialogModeAutoAccept)
++    return new AutoAcceptSelectFileDialog(listener, std::move(policy));
++
+ #if BUILDFLAG(USE_DBUS)
+   return new SelectFileDialogLinuxPortal(listener, std::move(policy));
+ #else
+   const LinuxUi* linux_ui = LinuxUi::instance();
+   if (linux_ui) {
+-    return linux_ui->CreateSelectFileDialog(listener, std::move(policy));
++    auto* dialog = linux_ui->CreateSelectFileDialog(listener, std::move(policy));
++    if (dialog)
++      return dialog;
+   }
+-  return nullptr;
++  LOG(WARNING) << "SelectFileDialog requested without native backend";
++  return new AutoCancelSelectFileDialog(listener, std::move(policy));
+ #endif
+ }
+ 
+-- 
+2.43.0
+
