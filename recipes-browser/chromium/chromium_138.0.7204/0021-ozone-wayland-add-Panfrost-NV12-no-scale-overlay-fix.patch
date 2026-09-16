@@ -1,4 +1,4 @@
-From dab49e5d5d9c8d3bd7a90187208a8ceec7fec2b3 Mon Sep 17 00:00:00 2001
+From 3519fcc0991471a404232530ef00fada9fccccdc Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Fri, 14 Aug 2026 13:19:10 +0900
 Subject: [PATCH 21/21] ozone/wayland: add Panfrost NV12 no-scale overlay fixes
@@ -357,18 +357,24 @@ index 907a58f1fb..42f1cd4d63 100644
  
  const scoped_refptr<FrameResource>& V4L2Buffer::GetFrameResource() {
 diff --git a/ui/base/ui_base_features.cc b/ui/base/ui_base_features.cc
-index 82a0fc43ab..00a8d74f08 100644
+index f0d79bcd6a..878e29e045 100644
 --- a/ui/base/ui_base_features.cc
 +++ b/ui/base/ui_base_features.cc
-@@ -148,6 +148,14 @@ BASE_FEATURE(kV4L2NoScaleOverlay,
+@@ -149,12 +149,20 @@ BASE_FEATURE(kV4L2NoScaleOverlay,
               "V4L2NoScaleOverlay",
               base::FEATURE_DISABLED_BY_DEFAULT);
  
 +const base::FeatureParam<bool> kV4L2NoScaleOverlayPanfrostWorkarounds{
 +    &kV4L2NoScaleOverlay, "panfrost_workarounds", false};
 +
+ bool IsV4L2NoScaleOverlayEnabled() {
+   return base::FeatureList::IsEnabled(kV4L2NoScaleOverlay) ||
+          base::CommandLine::ForCurrentProcess()->HasSwitch(
+              switches::kEnableV4L2NoScaleOverlay);
+ }
+ 
 +bool IsV4L2NoScaleOverlayPanfrostWorkaroundsEnabled() {
-+  return base::FeatureList::IsEnabled(kV4L2NoScaleOverlay) &&
++  return IsV4L2NoScaleOverlayEnabled() &&
 +         kV4L2NoScaleOverlayPanfrostWorkarounds.Get();
 +}
 +
@@ -376,13 +382,13 @@ index 82a0fc43ab..00a8d74f08 100644
  // If this feature is enabled, users not specify --ozone-platform-hint switch
  // will get --ozone-platform-hint=auto treatment. https://crbug.com/40250220.
 diff --git a/ui/base/ui_base_features.h b/ui/base/ui_base_features.h
-index a459356d6f..37a9c69acb 100644
+index a79f50d843..ca8ea429ba 100644
 --- a/ui/base/ui_base_features.h
 +++ b/ui/base/ui_base_features.h
-@@ -131,6 +131,8 @@ BASE_DECLARE_FEATURE(kWaylandSessionManagement);
- 
+@@ -132,6 +132,8 @@ BASE_DECLARE_FEATURE(kWaylandSessionManagement);
  COMPONENT_EXPORT(UI_BASE_FEATURES)
  BASE_DECLARE_FEATURE(kV4L2NoScaleOverlay);
+ COMPONENT_EXPORT(UI_BASE_FEATURES) bool IsV4L2NoScaleOverlayEnabled();
 +COMPONENT_EXPORT(UI_BASE_FEATURES)
 +bool IsV4L2NoScaleOverlayPanfrostWorkaroundsEnabled();
  
@@ -431,7 +437,7 @@ index 1b5d52cbb3..5cb0d11e94 100644
        LOG(ERROR) << "nullptr returned from gbm_bo_import";
        return nullptr;
 diff --git a/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc b/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
-index 28af6adc6b..17c823dde9 100644
+index a167f4f3d5..5aa9fbe676 100644
 --- a/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
 +++ b/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
 @@ -29,10 +29,18 @@ bool IsYuvCandidate(const OverlaySurfaceCandidate& candidate) {
@@ -439,7 +445,7 @@ index 28af6adc6b..17c823dde9 100644
  }
  
 +bool IsV4L2NoScaleOverlayEnabled() {
-+  return base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay);
++  return ::features::IsV4L2NoScaleOverlayEnabled();
 +}
 +
 +bool IsV4L2NoScaleOverlayPanfrostWorkaroundsEnabled() {
@@ -449,7 +455,7 @@ index 28af6adc6b..17c823dde9 100644
  void LogYuvCandidateDecision(const OverlaySurfaceCandidate& candidate,
                               const char* reason,
                               bool handled) {
--  if (!base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay)) {
+-  if (!::features::IsV4L2NoScaleOverlayEnabled()) {
 +  if (!IsV4L2NoScaleOverlayEnabled()) {
      return;
    }
