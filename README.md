@@ -75,6 +75,17 @@ It is kept separate from `use-v4l2` because it can affect composition behavior,
 such as drawing video above overlapping HTML controls. Enabling
 `use-v4l2-overlay` also enables `use-v4l2`.
 
+If Chromium is built with `use-v4l2` but without `use-v4l2-overlay`, the overlay
+path is disabled by default. You can enable it for an individual launch without
+editing the Chromium wrapper by adding the following runtime option:
+
+```console
+$ chromium --enable-v4l2-no-scale-overlay
+```
+
+The same scaling, cropping, and composition limitations apply when enabling
+the overlay path at runtime.
+
 ### Disabling Chromium managed policy
 
 By default, this layer installs a Chromium managed policy file that suppresses
