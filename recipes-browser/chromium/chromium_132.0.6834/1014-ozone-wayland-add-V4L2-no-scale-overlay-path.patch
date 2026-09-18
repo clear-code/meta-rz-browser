@@ -1,4 +1,4 @@
-From 276902d617d969031818e802834755bed54046bd Mon Sep 17 00:00:00 2001
+From c032077ea15305d715c0f0ffea4217ec4bee1fc4 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Tue, 11 Aug 2026 18:59:23 +0900
 Subject: [PATCH] ozone/wayland: add V4L2 no-scale overlay path
@@ -22,6 +22,8 @@ Upstream-Status: Inappropriate [RZ/G2L-specific V4L2/Weston overlay workaround]
  .../display/overlay_candidate_factory.cc      | 160 +++++++++++++++++-
  .../overlay_processor_using_strategy.cc       | 145 +++++++++++++++-
  .../viz/service/display/skia_renderer.cc      |  28 +++
+ media/gpu/v4l2/BUILD.gn                       |   1 +
+ media/gpu/v4l2/v4l2_queue.cc                  |   9 +-
  ui/base/ui_base_features.cc                   |  12 ++
  ui/base/ui_base_features.h                    |   4 +
  ui/base/ui_base_switches.cc                   |   3 +
@@ -30,7 +32,7 @@ Upstream-Status: Inappropriate [RZ/G2L-specific V4L2/Weston overlay workaround]
  ui/ozone/common/features.cc                   |   5 +-
  .../wayland/gpu/gbm_pixmap_wayland.cc         |  83 ++++++++-
  .../wayland/gpu/wayland_overlay_manager.cc    | 102 ++++++++++-
- 12 files changed, 533 insertions(+), 12 deletions(-)
+ 14 files changed, 542 insertions(+), 13 deletions(-)
 
 diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
 index 1db2476ae1..d00237e4fa 100644
@@ -579,6 +581,46 @@ index 5b7df13c2e..b7696bf09e 100644
    // We need only RGB portion of the color space, YUV conversion handled in
    // skia.
    const gfx::ColorSpace src_color_space =
+diff --git a/media/gpu/v4l2/BUILD.gn b/media/gpu/v4l2/BUILD.gn
+index 7fc1ea38de..76f7e0e38a 100644
+--- a/media/gpu/v4l2/BUILD.gn
++++ b/media/gpu/v4l2/BUILD.gn
+@@ -122,6 +122,7 @@ source_set("v4l2") {
+     "//media/gpu/chromeos:common",
+     "//third_party/libgav1:libgav1_parser",
+     "//third_party/libyuv",
++    "//ui/base:features",
+     "//ui/gfx/geometry",
+     "//ui/ozone",
+   ]
+diff --git a/media/gpu/v4l2/v4l2_queue.cc b/media/gpu/v4l2/v4l2_queue.cc
+index 96a0ed17a9..084863b956 100644
+--- a/media/gpu/v4l2/v4l2_queue.cc
++++ b/media/gpu/v4l2/v4l2_queue.cc
+@@ -19,6 +19,7 @@
+ #include "media/gpu/chromeos/native_pixmap_frame_resource.h"
+ #include "media/gpu/chromeos/platform_video_frame_utils.h"
+ #include "media/gpu/macros.h"
++#include "ui/base/ui_base_features.h"
+ 
+ namespace media {
+ 
+@@ -351,8 +352,14 @@ scoped_refptr<FrameResource> V4L2Buffer::CreateFrame() {
+ 
+   gfx::Size size(format_.fmt.pix_mp.width, format_.fmt.pix_mp.height);
+ 
+-  return NativePixmapFrameResource::Create(
++  scoped_refptr<FrameResource> frame = NativePixmapFrameResource::Create(
+       *layout, gfx::Rect(size), size, std::move(dmabuf_fds), base::TimeDelta());
++  if (frame && frame->format() == PIXEL_FORMAT_NV12 &&
++      ::features::IsV4L2NoScaleOverlayEnabled()) {
++    frame->metadata().allow_overlay = true;
++  }
++
++  return frame;
+ }
+ 
+ const scoped_refptr<FrameResource>& V4L2Buffer::GetFrameResource() {
 diff --git a/ui/base/ui_base_features.cc b/ui/base/ui_base_features.cc
 index 6a4eaa26c9..9e10db1ef9 100644
 --- a/ui/base/ui_base_features.cc
