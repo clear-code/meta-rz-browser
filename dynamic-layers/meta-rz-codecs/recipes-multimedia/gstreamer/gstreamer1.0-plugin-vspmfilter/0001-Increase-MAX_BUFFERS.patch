@@ -1,6 +1,6 @@
-From 97fbe427c7cffb2d4635e5989d65a378414653be Mon Sep 17 00:00:00 2001
+From 88ca1cab35cc718a058f822072f7fa4eaf6983c0 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
-Date: Fri, 5 Sep 2025 16:04:03 +0900
+Date: Thu, 24 Sep 2026 13:15:02 +0900
 Subject: [PATCH] Increase MAX_BUFFERS
 
 Chromium requires at least 10 buffers.
@@ -10,10 +10,11 @@ Upstream-Status: Pending
 Signed-off-by: Takuro Ashie <ashie@clear-code.com>
 ---
  gstvspmfilter.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ gstvspmfilter.h | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/gstvspmfilter.c b/gstvspmfilter.c
-index 6ef71fb..8d026fd 100644
+index b061cd3..433afcd 100644
 --- a/gstvspmfilter.c
 +++ b/gstvspmfilter.c
 @@ -61,7 +61,7 @@ GST_DEBUG_CATEGORY_EXTERN (GST_CAT_PERFORMANCE);
@@ -23,5 +24,21 @@ index 6ef71fb..8d026fd 100644
 -#define MAX_BUFFERS (5)
 +#define MAX_BUFFERS (10)
  
- GType gst_vspm_filter_get_type (void);
+ /* isu hardware limitation */
+ #define ISU_STRIDE_ALIGN (32)
+diff --git a/gstvspmfilter.h b/gstvspmfilter.h
+index e451a5d..6632347 100644
+--- a/gstvspmfilter.h
++++ b/gstvspmfilter.h
+@@ -150,7 +150,7 @@ typedef struct {
+ } Vspm_dmabuff;
  
+ typedef struct {
+-  Vspm_dmabuff vspm[5];
++  Vspm_dmabuff vspm[10];
+   int used;
+ } Vspm_mmng_ar;
+ 
+-- 
+2.43.0
+
