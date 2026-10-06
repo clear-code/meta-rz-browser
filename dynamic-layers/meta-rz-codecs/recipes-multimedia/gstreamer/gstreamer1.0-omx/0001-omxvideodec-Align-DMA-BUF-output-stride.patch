@@ -1,0 +1,65 @@
+From 502e5463354405faf9e93bd6028b4024027f3106 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Tue, 6 Oct 2026 14:52:45 +0900
+Subject: [PATCH] omxvideodec: Align DMA-BUF output stride
+
+Round decoder output strides to the alignment required by the RZ/Mali
+DMA-BUF path before OMX output buffers are allocated. This prevents
+600-wide NV12 frames from being exported with a 600-byte pitch; they
+use 608 bytes instead.
+
+Upstream-Status: Pending
+---
+ omx/gstomxvideodec.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/omx/gstomxvideodec.c b/omx/gstomxvideodec.c
+index cdfa874..724d923 100644
+--- a/omx/gstomxvideodec.c
++++ b/omx/gstomxvideodec.c
+@@ -1570,6 +1570,21 @@ add_caps_gl_memory_feature (GstCaps * caps)
+ }
+ #endif
+ 
++static guint
++gst_omx_video_dec_get_stride_alignment (GstVideoFormat format)
++{
++  switch (format) {
++    case GST_VIDEO_FORMAT_NV12:
++    case GST_VIDEO_FORMAT_NV21:
++    case GST_VIDEO_FORMAT_I420:
++    case GST_VIDEO_FORMAT_YV12:
++    case GST_VIDEO_FORMAT_P010_10LE:
++      return 16;
++    default:
++      return 64;
++  }
++}
++
+ static OMX_ERRORTYPE
+ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
+ {
+@@ -1841,6 +1856,15 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
+ 
+     port_def.format.video.nStride = MAX (out_width *
+         GST_VIDEO_FORMAT_INFO_PSTRIDE(info, 0), GST_OMX_VIDEO_DEC_MIN_STRIDE);
++
++    /* The RZ/Mali DMA-BUF path requires the actual allocation stride to be
++     * aligned, not only the GstVideoMeta stride advertised downstream. */
++    port_def.format.video.nStride = GST_ROUND_UP_N (
++        port_def.format.video.nStride,
++        gst_omx_video_dec_get_stride_alignment (format));
++
++    GST_DEBUG_OBJECT (self, "Setting aligned output stride to %u",
++        port_def.format.video.nStride);
+     port_def.format.video.nSliceHeight = MAX (out_height,
+         GST_OMX_VIDEO_DEC_MIN_SLICEHEIGHT);
+   }
+@@ -4320,4 +4344,3 @@ gst_omx_video_dec_calculate_scale_ratio (gint new_length, gint length)
+   /* Convert to Q15.16 format */
+   return (gint)(scale_ratio >> 16);
+ }
+-
+-- 
+2.34.1
+

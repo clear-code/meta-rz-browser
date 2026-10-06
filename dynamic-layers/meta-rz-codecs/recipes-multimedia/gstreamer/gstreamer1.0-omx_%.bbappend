@@ -5,6 +5,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}/:"
 
 SRC_URI += " \
     file://0001-omx-Drop-empty-video-decoder-outputs.patch \
+    file://0001-omxvideodec-Align-DMA-BUF-output-stride.patch \
 "
 
 # The upstream FLUSH event handling now wakes the input port on FLUSH_START and
