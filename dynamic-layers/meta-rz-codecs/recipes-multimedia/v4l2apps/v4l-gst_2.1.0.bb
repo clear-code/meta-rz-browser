@@ -17,13 +17,13 @@ SRC_URI = "git://github.com/clear-code/v4l-gst.git;protocol=https;branch=main \
 	   file://setup-v4l-gst.sh \
           "
 
-SRCREV = "a0620908b0401480493cd3264f3515bfdd15853e"
+SRCREV = "a6eaccf44283cffbdb4d625e847c51293499a273"
 
 PV .= "+git"
 
 S = "${WORKDIR}/git"
 
-inherit autotools pkgconfig systemd
+inherit meson pkgconfig systemd
 
 SYSTEMD_AUTO_ENABLE = "enable"
 SYSTEMD_SERVICE:${PN} = "v4l-gst.service"
