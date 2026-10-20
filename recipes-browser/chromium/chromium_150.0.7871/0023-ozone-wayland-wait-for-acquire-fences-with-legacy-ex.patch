@@ -1,0 +1,111 @@
+From 1b49f12f72371f5d60b58de72a98a250705f2b10 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Tue, 20 Oct 2026 09:53:30 +0900
+Subject: [PATCH 23/23] ozone/wayland: wait for acquire fences with legacy
+ explicit sync
+
+When legacy linux-explicit-synchronization is advertised but syncobj
+explicit sync is unavailable, consume acquire fences with the existing
+GPU-side worker wait instead of importing them into DMA-BUFs. This path
+resolved WebGL stuttering and black UI updates on RZ/G3E with Mali DDK.
+
+Preserve DMA-BUF release fence export and syncobj behavior.
+Add an opt-out for automatic selection and a force switch for the
+implicit-sync interop path. No diagnostic instrumentation is included.
+
+Upstream-Status: Inappropriate [embedded platform-specific workaround]
+---
+ ui/gl/gl_switches.cc                          | 10 ++++++++
+ ui/gl/gl_switches.h                           |  2 ++
+ .../host/wayland_buffer_manager_host.cc       | 24 +++++++++++++++++--
+ 3 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/ui/gl/gl_switches.cc b/ui/gl/gl_switches.cc
+index 3600c21358..45cd36ca0e 100644
+--- a/ui/gl/gl_switches.cc
++++ b/ui/gl/gl_switches.cc
+@@ -161,6 +161,16 @@ const char kEnableUnsafeSwiftShader[] = "enable-unsafe-swiftshader";
+ // to swiftshader.
+ const char kDisableD3D11Warp[] = "disable-d3d11-warp";
+ 
++// Force worker-side acquire fence waits on the Wayland DMA-BUF interop path.
++// This does not affect syncobj explicit sync or release fence export.
++const char kWaylandForceCpuAcquireFenceWait[] =
++    "wayland-force-cpu-acquire-fence-wait";
++
++// Disable automatic CPU acquire waits for legacy-explicit-sync compositors.
++// An explicitly forced CPU wait still takes precedence over this opt-out.
++const char kDisableWaylandAutoCpuAcquireFenceWait[] =
++    "disable-wayland-auto-cpu-acquire-fence-wait";
++
+ // Used for overriding the swap chain format for direct composition SDR video
+ // overlays.
+ const char kDirectCompositionVideoSwapChainFormat[] =
+diff --git a/ui/gl/gl_switches.h b/ui/gl/gl_switches.h
+index 54a3d8f7f8..35da165cd1 100644
+--- a/ui/gl/gl_switches.h
++++ b/ui/gl/gl_switches.h
+@@ -82,6 +82,8 @@ GL_EXPORT extern const char kEnableDirectCompositionVideoOverlays[];
+ GL_EXPORT extern const char kUseAdapterLuid[];
+ GL_EXPORT extern const char kEnableUnsafeSwiftShader[];
+ GL_EXPORT extern const char kDisableD3D11Warp[];
++GL_EXPORT extern const char kWaylandForceCpuAcquireFenceWait[];
++GL_EXPORT extern const char kDisableWaylandAutoCpuAcquireFenceWait[];
+ 
+ GL_EXPORT extern const char kDirectCompositionVideoSwapChainFormat[];
+ GL_EXPORT extern const char kTintDcLayer[];
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
+index af13acad9c..4526a68a12 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
+@@ -8,9 +8,11 @@
+ #include <sys/utsname.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/i18n/number_formatting.h"
+@@ -25,6 +27,7 @@
+ #include "ui/gfx/gpu_fence_handle.h"
+ #include "ui/gfx/linux/dmabuf_uapi.h"
+ #include "ui/gfx/linux/drm_util_linux.h"
++#include "ui/gl/gl_switches.h"
+ #include "ui/ozone/platform/wayland/common/wayland_overlay_config.h"
+ #include "ui/ozone/platform/wayland/host/drm_syncobj_ioctl_wrapper.h"
+ #include "ui/ozone/platform/wayland/host/wayland_buffer_backing.h"
+@@ -104,8 +107,25 @@ bool WaylandBufferManagerHost::SupportsDmabuf() const {
+ }
+ 
+ bool WaylandBufferManagerHost::SupportsAcquireFence() const {
+-  return connection_->SupportsExplicitSync() ||
+-         connection_->UseImplicitSyncInterop();
++  if (connection_->UseImplicitSyncInterop()) {
++    const auto* command_line = base::CommandLine::ForCurrentProcess();
++    const bool force_cpu = command_line->HasSwitch(
++        switches::kWaylandForceCpuAcquireFenceWait);
++    // Chromium no longer binds legacy explicit sync. Wait before committing
++    // buffers on compositors still advertising it when syncobj is unavailable.
++    // Only override acquire handling; preserve release fence export.
++    const bool legacy_explicit_advertised = std::ranges::any_of(
++        connection_->available_globals(), [](const auto& global) {
++          return global.first == "zwp_linux_explicit_synchronization_v1" &&
++                 global.second >= 1;
++        });
++    const bool auto_cpu =
++        legacy_explicit_advertised &&
++        !command_line->HasSwitch(
++            switches::kDisableWaylandAutoCpuAcquireFenceWait);
++    return !force_cpu && !auto_cpu;
++  }
++  return connection_->SupportsExplicitSync();
+ }
+ 
+ bool WaylandBufferManagerHost::SupportsViewporter() const {
+-- 
+2.43.0
+

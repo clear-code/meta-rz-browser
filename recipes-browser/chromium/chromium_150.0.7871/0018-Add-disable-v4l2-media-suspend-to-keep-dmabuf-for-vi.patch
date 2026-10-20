@@ -1,7 +1,7 @@
 From 61a9e76bf75de6a0046c35813c475e28c606502a Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Thu, 30 Apr 2026 18:48:29 +0900
-Subject: [PATCH 18/22] Add --disable-v4l2-media-suspend to keep dmabuf for
+Subject: [PATCH 18/23] Add --disable-v4l2-media-suspend to keep dmabuf for
  video preview
 
 Upstream-Status: Inappropriate [oe specific]

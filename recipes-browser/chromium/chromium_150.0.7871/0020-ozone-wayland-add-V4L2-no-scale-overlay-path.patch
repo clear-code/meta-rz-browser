@@ -1,7 +1,7 @@
-From 4197995cb7b4f76d2ba17269a95b400e84dc78a4 Mon Sep 17 00:00:00 2001
+From 4ac709bf92b98f5bcbc8c075ce5a12d69fe97a47 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Tue, 11 Aug 2026 18:13:12 +0900
-Subject: [PATCH 20/22] ozone/wayland: add V4L2 no-scale overlay path
+Subject: [PATCH 20/23] ozone/wayland: add V4L2 no-scale overlay path
 
 Add a V4L2NoScaleOverlay feature for RZ/G2L Wayland/Westonl deployments
 where V4L2 decoded NV12 dmabufs can be promoted to a KMS plane only
@@ -27,13 +27,14 @@ Upstream-Status: Inappropriate [RZ/G2L-specific V4L2/Weston overlay workaround]
  .../display/overlay_candidate_factory.cc      | 161 +++++++++++++++++-
  .../overlay_processor_using_strategy.cc       | 145 +++++++++++++++-
  .../viz/service/display/skia_renderer.cc      |  27 ++-
- ui/base/ui_base_features.cc                   |   3 +
- ui/base/ui_base_features.h                    |   3 +
+ ui/base/ui_base_features.cc                   |  10 ++
+ ui/base/ui_base_features.h                    |   4 +
+ ui/base/ui_base_switches.h                    |   4 +
  ui/ozone/common/BUILD.gn                      |   1 +
  ui/ozone/common/features.cc                   |   5 +-
  .../wayland/gpu/gbm_pixmap_wayland.cc         |  85 ++++++++-
  .../wayland/gpu/wayland_overlay_manager.cc    | 102 ++++++++++-
- 10 files changed, 517 insertions(+), 16 deletions(-)
+ 11 files changed, 529 insertions(+), 16 deletions(-)
 
 diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
 index 2488069770..69a7c0891b 100644
@@ -48,7 +49,7 @@ index 2488069770..69a7c0891b 100644
      "//ui/display/types",
      "//ui/gfx/animation",
 diff --git a/components/viz/service/display/overlay_candidate_factory.cc b/components/viz/service/display/overlay_candidate_factory.cc
-index b0ede67395..f797c0ed61 100644
+index b0ede67395..421d6a1e3c 100644
 --- a/components/viz/service/display/overlay_candidate_factory.cc
 +++ b/components/viz/service/display/overlay_candidate_factory.cc
 @@ -7,6 +7,8 @@
@@ -131,7 +132,7 @@ index b0ede67395..f797c0ed61 100644
 +}
 +
 +bool ShouldLogVideoOverlayDebug() {
-+  if (!base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay)) {
++  if (!::features::IsV4L2NoScaleOverlayEnabled()) {
 +    return false;
 +  }
 +  static int log_count = 0;
@@ -333,7 +334,7 @@ index b0ede67395..f797c0ed61 100644
    }
  
 diff --git a/components/viz/service/display/overlay_processor_using_strategy.cc b/components/viz/service/display/overlay_processor_using_strategy.cc
-index ae5d05b2f6..9257c8f6e2 100644
+index ae5d05b2f6..3e48e72f8b 100644
 --- a/components/viz/service/display/overlay_processor_using_strategy.cc
 +++ b/components/viz/service/display/overlay_processor_using_strategy.cc
 @@ -40,6 +40,7 @@
@@ -352,7 +353,7 @@ index ae5d05b2f6..9257c8f6e2 100644
 +constexpr int kV4lGstOverlaySortLogLimit = 8;
 +
 +bool IsV4L2NoScaleOverlayEnabled() {
-+  return base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay);
++  return ::features::IsV4L2NoScaleOverlayEnabled();
 +}
 +
 +bool ShouldLogV4lGstOverlayPromoteDebug() {
@@ -531,7 +532,7 @@ index ae5d05b2f6..9257c8f6e2 100644
      LogStrategyEnumUMA(test_candidate.strategy->GetUMAEnum());
    }
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index 9da0682f44..74f8dcccdb 100644
+index 9da0682f44..39d661dbea 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
 @@ -13,7 +13,6 @@
@@ -549,7 +550,7 @@ index 9da0682f44..74f8dcccdb 100644
 +constexpr int kV4lGstOverlayRendererLogLimit = 4;
 +
 +bool ShouldLogV4lGstOverlayRendererDebug() {
-+  if (!base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay)) {
++  if (!::features::IsV4L2NoScaleOverlayEnabled()) {
 +    return false;
 +  }
 +  static int log_count = 0;
@@ -583,33 +584,63 @@ index 9da0682f44..74f8dcccdb 100644
    // hardware path for power efficiency even if it's slightly incorrect. To
    // avoid color changes during promotion we use the same color space for
 diff --git a/ui/base/ui_base_features.cc b/ui/base/ui_base_features.cc
-index f9d1b0539a..bf902961d7 100644
+index f9d1b0539a..814019b540 100644
 --- a/ui/base/ui_base_features.cc
 +++ b/ui/base/ui_base_features.cc
-@@ -25,6 +25,9 @@
+@@ -10,6 +10,7 @@
+ #include "base/feature_list.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "build/build_config.h"
++#include "ui/base/ui_base_switches.h"
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ #include "base/android/android_info.h"
+@@ -25,6 +26,15 @@
  
  namespace features {
  
 +// Allows no-scale V4L2 NV12 video buffers to be delegated as Wayland overlays.
 +BASE_FEATURE(kV4L2NoScaleOverlay, base::FEATURE_DISABLED_BY_DEFAULT);
 +
++bool IsV4L2NoScaleOverlayEnabled() {
++  return base::FeatureList::IsEnabled(kV4L2NoScaleOverlay) ||
++         base::CommandLine::ForCurrentProcess()->HasSwitch(
++             switches::kEnableV4L2NoScaleOverlay);
++}
++
  // If enabled, generates an empty GestureScrollUpdate if the preceding TouchMove
  // event had no gestures and sends both events together.
  BASE_FEATURE(kSendEmptyGestureScrollUpdate, base::FEATURE_ENABLED_BY_DEFAULT);
 diff --git a/ui/base/ui_base_features.h b/ui/base/ui_base_features.h
-index a68a5fbcd7..2919e86fa2 100644
+index a68a5fbcd7..df0b0d5161 100644
 --- a/ui/base/ui_base_features.h
 +++ b/ui/base/ui_base_features.h
-@@ -13,6 +13,9 @@
+@@ -13,6 +13,10 @@
  
  namespace features {
  
 +COMPONENT_EXPORT(UI_BASE_FEATURES)
 +BASE_DECLARE_FEATURE(kV4L2NoScaleOverlay);
++COMPONENT_EXPORT(UI_BASE_FEATURES) bool IsV4L2NoScaleOverlayEnabled();
 +
  COMPONENT_EXPORT(UI_BASE_FEATURES)
  BASE_DECLARE_FEATURE(kSendEmptyGestureScrollUpdate);
  COMPONENT_EXPORT(UI_BASE_FEATURES)
+diff --git a/ui/base/ui_base_switches.h b/ui/base/ui_base_switches.h
+index 78095269c8..6d46add630 100644
+--- a/ui/base/ui_base_switches.h
++++ b/ui/base/ui_base_switches.h
+@@ -58,6 +58,10 @@ inline constexpr char kDisableGtkIme[] = "disable-gtk-ime";
+ inline constexpr char kDRMVirtualConnectorIsExternal[] =
+     "drm-virtual-connector-is-external";
+ 
++// Enables the RZ/G V4L2 no-scale Wayland overlay path.
++inline constexpr char kEnableV4L2NoScaleOverlay[] =
++    "enable-v4l2-no-scale-overlay";
++
+ // Forces the caption style for WebVTT captions.
+ inline constexpr char kForceCaptionStyle[] = "force-caption-style";
+ 
 diff --git a/ui/ozone/common/BUILD.gn b/ui/ozone/common/BUILD.gn
 index 808b393c4f..ae739e0934 100644
 --- a/ui/ozone/common/BUILD.gn
@@ -623,7 +654,7 @@ index 808b393c4f..ae739e0934 100644
      "//ui/gl:buildflags",
    ]
 diff --git a/ui/ozone/common/features.cc b/ui/ozone/common/features.cc
-index 40e9418f6a..a007a4b32a 100644
+index 40e9418f6a..538eb36662 100644
 --- a/ui/ozone/common/features.cc
 +++ b/ui/ozone/common/features.cc
 @@ -4,6 +4,8 @@
@@ -641,12 +672,12 @@ index 40e9418f6a..a007a4b32a 100644
  bool IsWaylandOverlayDelegationEnabled() {
 -  return base::FeatureList::IsEnabled(kWaylandOverlayDelegation);
 +  return base::FeatureList::IsEnabled(kWaylandOverlayDelegation) ||
-+         base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay);
++         ::features::IsV4L2NoScaleOverlayEnabled();
  }
  
  bool IsWaylandFractionalScaleV1Enabled() {
 diff --git a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
-index 0f6c17b2f5..a19b332f0c 100644
+index 0f6c17b2f5..1ffd5363d3 100644
 --- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 +++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 @@ -11,11 +11,13 @@
@@ -682,7 +713,7 @@ index 0f6c17b2f5..a19b332f0c 100644
 +}
 +
 +bool IsV4L2NoScaleOverlayEnabled() {
-+  return base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay);
++  return ::features::IsV4L2NoScaleOverlayEnabled();
 +}
 +
 +bool ShouldLogOverlayDebug() {
@@ -789,7 +820,7 @@ index 0f6c17b2f5..a19b332f0c 100644
  }
  
 diff --git a/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc b/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
-index 8000d89fc9..a641bf3634 100644
+index 8000d89fc9..23dacfbf74 100644
 --- a/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
 +++ b/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
 @@ -4,10 +4,13 @@
@@ -820,7 +851,7 @@ index 8000d89fc9..a641bf3634 100644
 +void LogYuvCandidateDecision(const OverlaySurfaceCandidate& candidate,
 +                             const char* reason,
 +                             bool handled) {
-+  if (!base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay)) {
++  if (!::features::IsV4L2NoScaleOverlayEnabled()) {
 +    return;
 +  }
 +  static int log_count = 0;

@@ -1,7 +1,7 @@
-From dd20a817286371d6e73db584b861a7729da7ef70 Mon Sep 17 00:00:00 2001
+From 5652f38eb77d2753d114a8a899280beb0f7dbeeb Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Fri, 14 Aug 2026 13:19:10 +0900
-Subject: [PATCH 21/22] ozone/wayland: add Panfrost NV12 no-scale overlay fixes
+Subject: [PATCH 21/23] ozone/wayland: add Panfrost NV12 no-scale overlay fixes
 
 Keep the existing V4L2NoScaleOverlay path split from Panfrost-specific
 stability fixes. Limit forced Viz promotion to no-scale/no-crop NV12,
@@ -28,8 +28,8 @@ Upstream-Status: Inappropriate [RZ/G2L Panfrost/Weston NV12 overlay workaround]
  media/gpu/v4l2/BUILD.gn                       |  1 +
  .../legacy/v4l2_video_decode_accelerator.cc   | 11 ++++++
  media/gpu/v4l2/v4l2_queue.cc                  | 14 +++++++-
- ui/base/ui_base_features.cc                   | 10 ++++++
- ui/base/ui_base_features.h                    |  3 ++
+ ui/base/ui_base_features.cc                   |  8 +++++
+ ui/base/ui_base_features.h                    |  2 ++
  ui/gfx/linux/gbm_wrapper.cc                   | 17 +++++++--
  .../wayland/gpu/wayland_overlay_manager.cc    | 21 ++++++++++-
  .../wayland/gpu/wayland_surface_factory.cc    | 33 ++++++++++++++---
@@ -39,7 +39,7 @@ Upstream-Status: Inappropriate [RZ/G2L Panfrost/Weston NV12 overlay workaround]
  .../wayland/host/wayland_frame_manager.cc     | 18 +++++++++-
  .../platform/wayland/host/wayland_surface.cc  |  5 +--
  .../platform/wayland/host/wayland_surface.h   |  3 +-
- 17 files changed, 221 insertions(+), 16 deletions(-)
+ 17 files changed, 218 insertions(+), 16 deletions(-)
 
 diff --git a/components/viz/service/display/overlay_strategy_single_on_top.cc b/components/viz/service/display/overlay_strategy_single_on_top.cc
 index 874ed40f40..906e8ce82d 100644
@@ -323,37 +323,40 @@ index 09fe5cec7e..4e3fe8d1ad 100644
  
  const scoped_refptr<FrameResource>& V4L2Buffer::GetFrameResource() {
 diff --git a/ui/base/ui_base_features.cc b/ui/base/ui_base_features.cc
-index bf902961d7..44f972fbdd 100644
+index 814019b540..ac64d8fd2f 100644
 --- a/ui/base/ui_base_features.cc
 +++ b/ui/base/ui_base_features.cc
-@@ -28,6 +28,16 @@ namespace features {
+@@ -29,12 +29,20 @@ namespace features {
  // Allows no-scale V4L2 NV12 video buffers to be delegated as Wayland overlays.
  BASE_FEATURE(kV4L2NoScaleOverlay, base::FEATURE_DISABLED_BY_DEFAULT);
  
 +const base::FeatureParam<bool> kV4L2NoScaleOverlayPanfrostWorkarounds{
 +    &kV4L2NoScaleOverlay, "panfrost_workarounds", false};
 +
+ bool IsV4L2NoScaleOverlayEnabled() {
+   return base::FeatureList::IsEnabled(kV4L2NoScaleOverlay) ||
+          base::CommandLine::ForCurrentProcess()->HasSwitch(
+              switches::kEnableV4L2NoScaleOverlay);
+ }
+ 
 +bool IsV4L2NoScaleOverlayPanfrostWorkaroundsEnabled() {
-+  return base::FeatureList::IsEnabled(kV4L2NoScaleOverlay) &&
++  return IsV4L2NoScaleOverlayEnabled() &&
 +         kV4L2NoScaleOverlayPanfrostWorkarounds.Get();
 +}
-+
-+
 +
  // If enabled, generates an empty GestureScrollUpdate if the preceding TouchMove
  // event had no gestures and sends both events together.
  BASE_FEATURE(kSendEmptyGestureScrollUpdate, base::FEATURE_ENABLED_BY_DEFAULT);
 diff --git a/ui/base/ui_base_features.h b/ui/base/ui_base_features.h
-index 2919e86fa2..4013d6e588 100644
+index df0b0d5161..f7ee77dc02 100644
 --- a/ui/base/ui_base_features.h
 +++ b/ui/base/ui_base_features.h
-@@ -15,6 +15,9 @@ namespace features {
- 
+@@ -16,6 +16,8 @@ namespace features {
  COMPONENT_EXPORT(UI_BASE_FEATURES)
  BASE_DECLARE_FEATURE(kV4L2NoScaleOverlay);
+ COMPONENT_EXPORT(UI_BASE_FEATURES) bool IsV4L2NoScaleOverlayEnabled();
 +COMPONENT_EXPORT(UI_BASE_FEATURES)
 +bool IsV4L2NoScaleOverlayPanfrostWorkaroundsEnabled();
-+
  
  COMPONENT_EXPORT(UI_BASE_FEATURES)
  BASE_DECLARE_FEATURE(kSendEmptyGestureScrollUpdate);
@@ -400,7 +403,7 @@ index 6784382aa1..64f27207fa 100644
        LOG(ERROR) << "nullptr returned from gbm_bo_import";
        return nullptr;
 diff --git a/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc b/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
-index a641bf3634..8f187887d4 100644
+index 23dacfbf74..66f41f4b72 100644
 --- a/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
 +++ b/ui/ozone/platform/wayland/gpu/wayland_overlay_manager.cc
 @@ -29,10 +29,18 @@ bool IsYuvCandidate(const OverlaySurfaceCandidate& candidate) {
@@ -408,7 +411,7 @@ index a641bf3634..8f187887d4 100644
  }
  
 +bool IsV4L2NoScaleOverlayEnabled() {
-+  return base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay);
++  return ::features::IsV4L2NoScaleOverlayEnabled();
 +}
 +
 +bool IsV4L2NoScaleOverlayPanfrostWorkaroundsEnabled() {
@@ -418,7 +421,7 @@ index a641bf3634..8f187887d4 100644
  void LogYuvCandidateDecision(const OverlaySurfaceCandidate& candidate,
                               const char* reason,
                               bool handled) {
--  if (!base::FeatureList::IsEnabled(::features::kV4L2NoScaleOverlay)) {
+-  if (!::features::IsV4L2NoScaleOverlayEnabled()) {
 +  if (!IsV4L2NoScaleOverlayEnabled()) {
      return;
    }

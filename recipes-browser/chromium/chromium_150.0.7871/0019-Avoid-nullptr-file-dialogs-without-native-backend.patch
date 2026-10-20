@@ -1,7 +1,7 @@
 From 6658833bce75ac1b7f78c5a0d4967f9dd187b51e Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Thu, 7 May 2026 13:08:03 +0900
-Subject: [PATCH 19/22] Avoid nullptr file dialogs without native backend
+Subject: [PATCH 19/23] Avoid nullptr file dialogs without native backend
 
 Adapt to Chromium 150's simplified dialog selection: retain the portal
 backend when DBus is enabled, honor the explicit headless modes first,

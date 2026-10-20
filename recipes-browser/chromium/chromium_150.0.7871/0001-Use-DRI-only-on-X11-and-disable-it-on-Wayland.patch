@@ -1,7 +1,7 @@
 From 91ebf8b8d04580f22cc9fdd6fa9f06ce583faba1 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Wed, 18 Mar 2026 17:12:45 +0900
-Subject: [PATCH 01/22] Use DRI only on X11 and disable it on Wayland
+Subject: [PATCH 01/23] Use DRI only on X11 and disable it on Wayland
 
 Previously, DRI was required regardless of the window system,
 causing an unintended dependency on DRI even under Wayland.
