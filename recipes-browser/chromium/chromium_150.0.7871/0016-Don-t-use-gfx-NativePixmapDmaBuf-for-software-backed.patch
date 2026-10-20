@@ -1,7 +1,7 @@
 From 77159c558c6ec07f43cb8e36a822546f5927bf94 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Wed, 26 Nov 2025 08:33:44 +0900
-Subject: [PATCH 16/22] Don't use gfx::NativePixmapDmaBuf for software backed
+Subject: [PATCH 16/23] Don't use gfx::NativePixmapDmaBuf for software backed
  video frames
 
 For Chromium 150, apply this change to the renamed

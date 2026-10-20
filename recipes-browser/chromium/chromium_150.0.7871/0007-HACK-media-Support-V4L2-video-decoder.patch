@@ -1,7 +1,7 @@
 From 8dfd1e1a543b0a78b36878e10f100f51292253db Mon Sep 17 00:00:00 2001
 From: Jeffy Chen <jeffy.chen@rock-chips.com>
 Date: Thu, 14 Dec 2023 10:00:22 +0800
-Subject: [PATCH 07/22] HACK: media: Support V4L2 video decoder
+Subject: [PATCH 07/23] HACK: media: Support V4L2 video decoder
 
 Original testing (before this Chromium 150 port) on RK3588 EVB with:
 1/ Install libmali, v4l-rkmpp, mpp and custom v4l-utils.
