@@ -1,0 +1,36 @@
+From 868beaf2318dbdc96dc0809ec220f0ceb933e32d Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Thu, 27 Aug 2026 11:53:42 +0900
+Subject: [PATCH 22/23] ozone/wayland: omit the ANGLE GBM native platform on
+ RZ/G
+
+RZ/G systems using Mali DDK may fail to initialize ANGLE when GBM
+is explicitly selected as the native EGL platform. Leave the native
+platform unspecified so the system EGL can initialize successfully.
+
+This only removes the native platform attribute passed to ANGLE.
+GBM buffer allocation and DMA-BUF sharing remain enabled.
+No runtime switch, build option, or retry mechanism is needed for
+this platform-specific patch.
+
+Upstream-Status: Inappropriate [embedded platform-specific workaround]
+---
+ ui/ozone/platform/wayland/gpu/wayland_gl_egl_utility.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ui/ozone/platform/wayland/gpu/wayland_gl_egl_utility.cc b/ui/ozone/platform/wayland/gpu/wayland_gl_egl_utility.cc
+index a85c4bc0cb..c940f7e36d 100644
+--- a/ui/ozone/platform/wayland/gpu/wayland_gl_egl_utility.cc
++++ b/ui/ozone/platform/wayland/gpu/wayland_gl_egl_utility.cc
+@@ -58,7 +58,7 @@ void WaylandGLEGLUtility::GetAdditionalEGLAttributes(
+     return;
+   }
+ 
+-#if defined(WAYLAND_GBM)
++#if 0
+   display_attributes->push_back(EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE);
+   display_attributes->push_back(EGL_PLATFORM_GBM_KHR);
+ #endif  // defined(WAYLAND_GBM)
+-- 
+2.43.0
+
