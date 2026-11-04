@@ -1,7 +1,7 @@
 From 1b49f12f72371f5d60b58de72a98a250705f2b10 Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Tue, 20 Oct 2026 09:53:30 +0900
-Subject: [PATCH 23/23] ozone/wayland: wait for acquire fences with legacy
+Subject: [PATCH 23/24] ozone/wayland: wait for acquire fences with legacy
  explicit sync
 
 When legacy linux-explicit-synchronization is advertised but syncobj
