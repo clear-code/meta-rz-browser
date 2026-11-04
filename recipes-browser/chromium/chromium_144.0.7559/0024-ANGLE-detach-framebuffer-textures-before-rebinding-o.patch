@@ -1,0 +1,129 @@
+From 0652dbfc486c3119a85d3475a8b2c3e16303a4ab Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 4 Nov 2026 08:09:00 +0900
+Subject: [PATCH 24/24] ANGLE: detach framebuffer textures before rebinding on
+ Mali-G31
+
+On Linux with the proprietary Mali-G31 driver, Chromium's dynamic MSAA
+path can corrupt SVG and icon rendering when the same framebuffer texture
+is switched between single-sample and multisampled-render-to-texture
+attachments. Mouse interaction also becomes noticeably sluggish.
+
+Issue a native texture detach before reattaching a 2D texture. Doing this
+in the GL backend preserves the detach even when ANGLE coalesces frontend
+attachment updates. Separate target tests found that texture detachment
+avoids the symptoms while renderbuffer-only detachment does not.
+
+Use a dedicated workaround enabled for proprietary Mali-G31 on Linux.
+Keep the existing renderbuffer workaround and other GPUs unchanged.
+The underlying driver failure mechanism has not been established.
+
+Upstream-Status: Pending
+---
+ .../angle/include/platform/autogen/FeaturesGL_autogen.h  | 6 ++++++
+ third_party/angle/include/platform/gl_features.json      | 8 ++++++++
+ .../angle/src/libANGLE/renderer/gl/FramebufferGL.cpp     | 9 +++++++++
+ .../angle/src/libANGLE/renderer/gl/renderergl_utils.cpp  | 5 +++++
+ .../angle/util/autogen/angle_features_autogen.cpp        | 1 +
+ third_party/angle/util/autogen/angle_features_autogen.h  | 1 +
+ 6 files changed, 30 insertions(+)
+
+diff --git a/third_party/angle/include/platform/autogen/FeaturesGL_autogen.h b/third_party/angle/include/platform/autogen/FeaturesGL_autogen.h
+index a732a77d66..d668ed2e73 100644
+--- a/third_party/angle/include/platform/autogen/FeaturesGL_autogen.h
++++ b/third_party/angle/include/platform/autogen/FeaturesGL_autogen.h
+@@ -476,6 +476,12 @@ struct FeaturesGL : FeatureSetBase
+         &members,
+     };
+ 
++    FeatureInfo unbindTextureBeforeFramebufferAttachment = {
++        "unbindTextureBeforeFramebufferAttachment",
++        FeatureCategory::OpenGLWorkarounds,
++        &members,
++    };
++
+     FeatureInfo disableTextureClampToBorder = {
+         "disableTextureClampToBorder",
+         FeatureCategory::OpenGLWorkarounds,
+diff --git a/third_party/angle/include/platform/gl_features.json b/third_party/angle/include/platform/gl_features.json
+index e993768974..4487d0957a 100644
+--- a/third_party/angle/include/platform/gl_features.json
++++ b/third_party/angle/include/platform/gl_features.json
+@@ -611,6 +611,14 @@
+             ],
+             "issue": "https://anglebug.com/42264072"
+         },
++        {
++            "name": "unbind_texture_before_framebuffer_attachment",
++            "category": "Workarounds",
++            "description": [
++                "Unbind 2D framebuffer texture attachments before rebinding them to avoid",
++                "corruption when switching between single-sample and multisampled rendering."
++            ]
++        },
+         {
+             "name": "disable_texture_clamp_to_border",
+             "category": "Workarounds",
+diff --git a/third_party/angle/src/libANGLE/renderer/gl/FramebufferGL.cpp b/third_party/angle/src/libANGLE/renderer/gl/FramebufferGL.cpp
+index ecea51f64e..bbcbcc2abf 100644
+--- a/third_party/angle/src/libANGLE/renderer/gl/FramebufferGL.cpp
++++ b/third_party/angle/src/libANGLE/renderer/gl/FramebufferGL.cpp
+@@ -90,6 +90,15 @@ void BindFramebufferAttachment(const FunctionsGL *functions,
+             const Texture *texture     = attachment->getTexture();
+             const TextureGL *textureGL = GetImplAs<TextureGL>(texture);
+ 
++            // Keep the detach in the backend so that frontend state coalescing
++            // cannot remove it when switching MSRTT attachments on Mali-G31.
++            if (features.unbindTextureBeforeFramebufferAttachment.enabled &&
++                texture->getType() == TextureType::_2D)
++            {
++                functions->framebufferTexture2D(GL_FRAMEBUFFER, attachmentPoint, GL_TEXTURE_2D, 0,
++                                                0);
++            }
++
+             if (texture->getType() == TextureType::_2D ||
+                 texture->getType() == TextureType::_2DMultisample ||
+                 texture->getType() == TextureType::Rectangle ||
+diff --git a/third_party/angle/src/libANGLE/renderer/gl/renderergl_utils.cpp b/third_party/angle/src/libANGLE/renderer/gl/renderergl_utils.cpp
+index d9694c0914..8aa6071396 100644
+--- a/third_party/angle/src/libANGLE/renderer/gl/renderergl_utils.cpp
++++ b/third_party/angle/src/libANGLE/renderer/gl/renderergl_utils.cpp
+@@ -2606,6 +2606,11 @@ void InitializeFeatures(const FunctionsGL *functions, angle::FeaturesGL *feature
+     ANGLE_FEATURE_CONDITION(features, alwaysUnbindFramebufferTexture2D,
+                             isNvidia && (IsWindows() || IsLinux()));
+ 
++    // Rebinding MSRTT textures without a native detach can corrupt rendering
++    // on the proprietary Mali-G31 driver. Keep the workaround GPU-specific.
++    ANGLE_FEATURE_CONDITION(features, unbindTextureBeforeFramebufferAttachment,
++                            IsLinux() && isMali && !isMesa && getMaliGNumber(functions) > 0);
++
+     // https://anglebug.com/42265877
+     ANGLE_FEATURE_CONDITION(features, disableTextureClampToBorder, false);
+ 
+diff --git a/third_party/angle/util/autogen/angle_features_autogen.cpp b/third_party/angle/util/autogen/angle_features_autogen.cpp
+index f38ad24bdc..49ebf80bc4 100644
+--- a/third_party/angle/util/autogen/angle_features_autogen.cpp
++++ b/third_party/angle/util/autogen/angle_features_autogen.cpp
+@@ -451,6 +451,7 @@ constexpr PackedEnumMap<Feature, const char *> kFeatureNames = {{
+     {Feature::SyncDefaultVertexArraysToDefault, "syncDefaultVertexArraysToDefault"},
+     {Feature::SyncMonolithicPipelinesToBlobCache, "syncMonolithicPipelinesToBlobCache"},
+     {Feature::UnbindFBOBeforeSwitchingContext, "unbindFBOBeforeSwitchingContext"},
++    {Feature::UnbindTextureBeforeFramebufferAttachment, "unbindTextureBeforeFramebufferAttachment"},
+     {Feature::UncurrentEglSurfaceUponSurfaceDestroy, "uncurrentEglSurfaceUponSurfaceDestroy"},
+     {Feature::UnfoldShortCircuits, "unfoldShortCircuits"},
+     {Feature::UnpackLastRowSeparatelyForPaddingInclusion, "unpackLastRowSeparatelyForPaddingInclusion"},
+diff --git a/third_party/angle/util/autogen/angle_features_autogen.h b/third_party/angle/util/autogen/angle_features_autogen.h
+index 0eef4d53d8..86f0874abc 100644
+--- a/third_party/angle/util/autogen/angle_features_autogen.h
++++ b/third_party/angle/util/autogen/angle_features_autogen.h
+@@ -451,6 +451,7 @@ enum class Feature
+     SyncDefaultVertexArraysToDefault,
+     SyncMonolithicPipelinesToBlobCache,
+     UnbindFBOBeforeSwitchingContext,
++    UnbindTextureBeforeFramebufferAttachment,
+     UncurrentEglSurfaceUponSurfaceDestroy,
+     UnfoldShortCircuits,
+     UnpackLastRowSeparatelyForPaddingInclusion,
+-- 
+2.43.0
+

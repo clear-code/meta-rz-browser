@@ -1,7 +1,7 @@
 From 868beaf2318dbdc96dc0809ec220f0ceb933e32d Mon Sep 17 00:00:00 2001
 From: Takuro Ashie <ashie@clear-code.com>
 Date: Thu, 27 Aug 2026 11:53:42 +0900
-Subject: [PATCH 22/23] ozone/wayland: omit the ANGLE GBM native platform on
+Subject: [PATCH 22/24] ozone/wayland: omit the ANGLE GBM native platform on
  RZ/G
 
 RZ/G systems using Mali DDK may fail to initialize ANGLE when GBM
