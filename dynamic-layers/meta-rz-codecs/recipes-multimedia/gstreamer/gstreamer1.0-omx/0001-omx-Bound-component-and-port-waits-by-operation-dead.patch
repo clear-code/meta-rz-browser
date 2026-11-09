@@ -1,0 +1,188 @@
+From c97ab1641c853b43a4e5592fa3853768e2716800 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 28 Oct 2026 16:53:38 +0900
+Subject: [PATCH 1/5] omx: Bound component and port waits by operation
+ deadlines
+
+Bound video decoder flush state waits and use one deadline for each
+state, port flush, buffer return and enable operation. Unrelated
+notifications must not restart the timeout.
+
+Upstream-Status: Pending
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ omx/gstomx.c         | 45 ++++++++++++++++++++++++++++++++++++++++----
+ omx/gstomxvideodec.c | 12 ++++++------
+ 2 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/omx/gstomx.c b/omx/gstomx.c
+index 1896158..5179dae 100644
+--- a/omx/gstomx.c
++++ b/omx/gstomx.c
+@@ -499,6 +499,27 @@ gst_omx_component_wait_message (GstOMXComponent * comp, GstClockTime timeout)
+   return signalled;
+ }
+ 
++/* A single deadline must cover the whole operation, not just one notification.
++ * Other ports and buffer callbacks can otherwise keep restarting the timeout. */
++static gint64
++gst_omx_wait_deadline (GstClockTime timeout)
++{
++  return timeout == GST_CLOCK_TIME_NONE ? -1 :
++      g_get_monotonic_time () + timeout / GST_USECOND;
++}
++
++static gboolean
++gst_omx_component_wait_message_until (GstOMXComponent *comp, gint64 deadline)
++{
++  gint64 remaining;
++
++  if (deadline < 0)
++    return gst_omx_component_wait_message (comp, GST_CLOCK_TIME_NONE);
++  remaining = deadline - g_get_monotonic_time ();
++  return remaining > 0 &&
++      gst_omx_component_wait_message (comp, remaining * GST_USECOND);
++}
++
+ static const gchar *
+ omx_event_type_to_str (OMX_EVENTTYPE event)
+ {
+@@ -1221,11 +1242,16 @@ gst_omx_component_get_state (GstOMXComponent * comp, GstClockTime timeout)
+ {
+   OMX_STATETYPE ret;
+   gboolean signalled = TRUE;
++  gint64 wait_until = -1;
+ 
+   g_return_val_if_fail (comp != NULL, OMX_StateInvalid);
+ 
+   GST_DEBUG_OBJECT (comp->parent, "Getting state of %s", comp->name);
+ 
++  if (timeout != GST_CLOCK_TIME_NONE)
++    wait_until = g_get_monotonic_time () +
++        timeout / (GST_SECOND / G_TIME_SPAN_SECOND);
++
+   g_mutex_lock (&comp->lock);
+ 
+   gst_omx_component_handle_messages (comp);
+@@ -1245,7 +1271,15 @@ gst_omx_component_get_state (GstOMXComponent * comp, GstClockTime timeout)
+   while (signalled && comp->last_error == OMX_ErrorNone
+       && comp->pending_state != OMX_StateInvalid) {
+ 
+-    signalled = gst_omx_component_wait_message (comp, timeout);
++    if (wait_until >= 0) {
++      gint64 remaining = wait_until - g_get_monotonic_time ();
++
++      signalled = remaining > 0 &&
++          gst_omx_component_wait_message (comp,
++          remaining * (GST_SECOND / G_TIME_SPAN_SECOND));
++    } else {
++      signalled = gst_omx_component_wait_message (comp, timeout);
++    }
+     if (signalled)
+       gst_omx_component_handle_messages (comp);
+   };
+@@ -2395,6 +2429,7 @@ gst_omx_port_set_flushing (GstOMXPort * port, GstClockTime timeout,
+ {
+   GstOMXComponent *comp;
+   OMX_ERRORTYPE err = OMX_ErrorNone;
++  gint64 deadline = gst_omx_wait_deadline (timeout);
+ 
+   g_return_val_if_fail (port != NULL, OMX_ErrorUndefined);
+ 
+@@ -2466,7 +2501,7 @@ gst_omx_port_set_flushing (GstOMXPort * port, GstClockTime timeout,
+     last_error = OMX_ErrorNone;
+     gst_omx_component_handle_messages (comp);
+     while (should_wait_until_flushed (port)) {
+-      signalled = gst_omx_component_wait_message (comp, timeout);
++      signalled = gst_omx_component_wait_message_until (comp, deadline);
+       if (signalled)
+         gst_omx_component_handle_messages (comp);
+ 
+@@ -3028,6 +3063,7 @@ gst_omx_port_wait_buffers_released_unlocked (GstOMXPort * port,
+   OMX_ERRORTYPE err = OMX_ErrorNone;
+   OMX_ERRORTYPE last_error;
+   gboolean signalled;
++  gint64 deadline = gst_omx_wait_deadline (timeout);
+ 
+   comp = port->comp;
+ 
+@@ -3057,7 +3093,7 @@ gst_omx_port_wait_buffers_released_unlocked (GstOMXPort * port,
+   while (signalled && last_error == OMX_ErrorNone && (port->buffers
+           && port->buffers->len >
+           g_queue_get_length (&port->pending_buffers))) {
+-    signalled = gst_omx_component_wait_message (comp, timeout);
++    signalled = gst_omx_component_wait_message_until (comp, deadline);
+     if (signalled)
+       gst_omx_component_handle_messages (comp);
+     last_error = comp->last_error;
+@@ -3220,6 +3256,7 @@ gst_omx_port_wait_enabled_unlocked (GstOMXPort * port, GstClockTime timeout)
+   gboolean signalled;
+   OMX_ERRORTYPE last_error;
+   gboolean enabled;
++  gint64 deadline = gst_omx_wait_deadline (timeout);
+ 
+   comp = port->comp;
+ 
+@@ -3258,7 +3295,7 @@ gst_omx_port_wait_enabled_unlocked (GstOMXPort * port, GstClockTime timeout)
+   while (signalled && last_error == OMX_ErrorNone &&
+       (! !port->port_def.bEnabled != ! !enabled || port->enabled_pending
+           || port->disabled_pending)) {
+-    signalled = gst_omx_component_wait_message (comp, timeout);
++    signalled = gst_omx_component_wait_message_until (comp, deadline);
+     if (signalled)
+       gst_omx_component_handle_messages (comp);
+     last_error = comp->last_error;
+diff --git a/omx/gstomxvideodec.c b/omx/gstomxvideodec.c
+index af7a07e..3585720 100644
+--- a/omx/gstomxvideodec.c
++++ b/omx/gstomxvideodec.c
+@@ -3660,13 +3660,13 @@ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+   /* 0) Pause the components */
+   if (gst_omx_component_get_state (self->dec, 0) == OMX_StateExecuting) {
+     gst_omx_component_set_state (self->dec, OMX_StatePause);
+-    gst_omx_component_get_state (self->dec, GST_CLOCK_TIME_NONE);
++    gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+   }
+ #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+   if (self->eglimage) {
+     if (gst_omx_component_get_state (self->egl_render, 0) == OMX_StateExecuting) {
+       gst_omx_component_set_state (self->egl_render, OMX_StatePause);
+-      gst_omx_component_get_state (self->egl_render, GST_CLOCK_TIME_NONE);
++      gst_omx_component_get_state (self->egl_render, 5 * GST_SECOND);
+     }
+   }
+ #endif
+@@ -3693,11 +3693,11 @@ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+ 
+   /* 3) Resume components */
+   gst_omx_component_set_state (self->dec, OMX_StateExecuting);
+-  gst_omx_component_get_state (self->dec, GST_CLOCK_TIME_NONE);
++  gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+ #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+   if (self->eglimage) {
+     gst_omx_component_set_state (self->egl_render, OMX_StateExecuting);
+-    gst_omx_component_get_state (self->egl_render, GST_CLOCK_TIME_NONE);
++    gst_omx_component_get_state (self->egl_render, 5 * GST_SECOND);
+   }
+ #endif
+ 
+@@ -3749,13 +3749,13 @@ gst_omx_video_dec_sink_event (GstVideoDecoder * decoder, GstEvent * event)
+     /* 0) Pause the components */
+     if (gst_omx_component_get_state (self->dec, 0) == OMX_StateExecuting) {
+       gst_omx_component_set_state (self->dec, OMX_StatePause);
+-      gst_omx_component_get_state (self->dec, GST_CLOCK_TIME_NONE);
++      gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+     }
+ #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+     if (self->eglimage) {
+       if (gst_omx_component_get_state (self->egl_render, 0) == OMX_StateExecuting) {
+ 	gst_omx_component_set_state (self->egl_render, OMX_StatePause);
+-	gst_omx_component_get_state (self->egl_render, GST_CLOCK_TIME_NONE);
++        gst_omx_component_get_state (self->egl_render, 5 * GST_SECOND);
+       }
+     }
+ #endif
+-- 
+2.43.0
+

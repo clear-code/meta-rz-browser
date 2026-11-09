@@ -1,0 +1,700 @@
+From 187593e8f79cfc92b2170c92b729e9076fd5f244 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 28 Oct 2026 16:53:38 +0900
+Subject: [PATCH 4/5] omxbufferpool: Retire shared OMX buffers on a cleanup
+ worker
+
+Keep imported buffers alive until shared memories return, reserve the
+retiring port against reuse and perform OMX teardown on a detached
+worker instead of the memory-return thread. Retain resources on unsafe
+teardown failures rather than freeing memory still used by OMX. This
+workaround depends on the operation-deadline helpers.
+
+Upstream-Status: Pending
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ omx/gstomx.c           |  87 +++++++++++++++++++++++++++----
+ omx/gstomx.h           |   3 ++
+ omx/gstomxallocator.c  | 107 +++++++++++++++++++++----------------
+ omx/gstomxallocator.h  |   6 ++-
+ omx/gstomxbufferpool.c | 116 ++++++++++++++++++++++++++++++++++-------
+ omx/gstomxbufferpool.h |   4 +-
+ omx/gstomxvideodec.c   |   6 ++-
+ 7 files changed, 251 insertions(+), 78 deletions(-)
+
+diff --git a/omx/gstomx.c b/omx/gstomx.c
+index 5179dae..21ff567 100644
+--- a/omx/gstomx.c
++++ b/omx/gstomx.c
+@@ -2200,7 +2200,7 @@ retry:
+   }
+ 
+   /* Check if the port is flushing */
+-  if (port->flushing) {
++  if (port->flushing || g_atomic_int_get (&port->retiring_pool)) {
+     GST_DEBUG_OBJECT (comp->parent, "Component %s port %d is flushing",
+         comp->name, port->index);
+     ret = GST_OMX_ACQUIRE_BUFFER_FLUSHING;
+@@ -2216,7 +2216,8 @@ retry:
+     if (comp->pending_reconfigure_outports) {
+       gst_omx_component_handle_messages (comp);
+       while (comp->pending_reconfigure_outports &&
+-          (err = comp->last_error) == OMX_ErrorNone && !port->flushing) {
++          (err = comp->last_error) == OMX_ErrorNone && !port->flushing &&
++          !g_atomic_int_get (&port->retiring_pool)) {
+         GST_DEBUG_OBJECT (comp->parent,
+             "Waiting for %s output ports to reconfigure", comp->name);
+         gst_omx_component_wait_message (comp, GST_CLOCK_TIME_NONE);
+@@ -2366,7 +2367,8 @@ gst_omx_port_release_buffer (GstOMXPort * port, GstOMXBuffer * buf)
+     goto done;
+   }
+ 
+-  if (port->flushing || port->disabled_pending || !port->port_def.bEnabled) {
++  if (port->flushing || g_atomic_int_get (&port->retiring_pool)
++      || port->disabled_pending || !port->port_def.bEnabled) {
+     GST_DEBUG_OBJECT (comp->parent,
+         "%s port %u is flushing or disabled, not releasing " "buffer",
+         comp->name, port->index);
+@@ -2567,7 +2569,7 @@ gst_omx_port_is_flushing (GstOMXPort * port)
+ }
+ 
+ static OMX_ERRORTYPE gst_omx_port_deallocate_buffers_unlocked (GstOMXPort *
+-    port);
++    port, gboolean retiring);
+ 
+ /* NOTE: Must be called while holding comp->lock, uses comp->messages_lock */
+ static OMX_ERRORTYPE
+@@ -2579,7 +2581,12 @@ gst_omx_port_allocate_buffers_unlocked (GstOMXPort * port,
+   gint i;
+   const GList *l;
+ 
+-  g_assert (!port->buffers || port->buffers->len == 0);
++  if (g_atomic_int_get (&port->retiring_pool) || (port->buffers
++          && port->buffers->len != 0)) {
++    GST_WARNING_OBJECT (port->comp->parent,
++        "Port %u still has buffers from its previous pool", port->index);
++    return OMX_ErrorIncorrectStateOperation;
++  }
+ 
+   g_return_val_if_fail (!port->tunneled, OMX_ErrorBadParameter);
+ 
+@@ -2656,7 +2663,7 @@ gst_omx_port_allocate_buffers_unlocked (GstOMXPort * port,
+               || images) ? GST_LEVEL_INFO : GST_LEVEL_ERROR, comp->parent,
+           "Failed to allocate buffer for %s port %u: %s (0x%08x)", comp->name,
+           port->index, gst_omx_error_to_string (err), err);
+-      gst_omx_port_deallocate_buffers_unlocked (port);
++      gst_omx_port_deallocate_buffers_unlocked (port, FALSE);
+       goto done;
+     }
+ 
+@@ -2885,7 +2892,7 @@ gst_omx_port_use_eglimages (GstOMXPort * port, const GList * images)
+ 
+ /* NOTE: Must be called while holding comp->lock, uses comp->messages_lock */
+ static OMX_ERRORTYPE
+-gst_omx_port_deallocate_buffers_unlocked (GstOMXPort * port)
++gst_omx_port_deallocate_buffers_unlocked (GstOMXPort * port, gboolean retiring)
+ {
+   GstOMXComponent *comp;
+   OMX_ERRORTYPE err = OMX_ErrorNone;
+@@ -2895,6 +2902,12 @@ gst_omx_port_deallocate_buffers_unlocked (GstOMXPort * port)
+ 
+   comp = port->comp;
+ 
++  if (g_atomic_int_get (&port->retiring_pool) && !retiring) {
++    GST_DEBUG_OBJECT (comp->parent,
++        "Port %u buffers are owned by a retiring pool", port->index);
++    return OMX_ErrorIncorrectStateOperation;
++  }
++
+   GST_INFO_OBJECT (comp->parent, "Deallocating buffers of %s port %u",
+       comp->name, port->index);
+ 
+@@ -2973,8 +2986,63 @@ gst_omx_port_deallocate_buffers (GstOMXPort * port)
+ 
+   g_return_val_if_fail (port != NULL, OMX_ErrorUndefined);
+ 
++  if (g_atomic_int_get (&port->retiring_pool))
++    return OMX_ErrorIncorrectStateOperation;
++
++  g_mutex_lock (&port->comp->lock);
++  err = gst_omx_port_deallocate_buffers_unlocked (port, FALSE);
++  g_mutex_unlock (&port->comp->lock);
++
++  return err;
++}
++
++void
++gst_omx_port_begin_retirement (GstOMXPort *port)
++{
++  /* Do not wait for comp->lock here: an OMX API holding it may be stuck. */
++  g_atomic_int_set (&port->retiring_pool, TRUE);
++  gst_omx_component_send_message (port->comp, NULL);
++}
++
++/* Only the cleanup worker may release buffers reserved by a retired pool. */
++OMX_ERRORTYPE
++gst_omx_port_finish_retirement (GstOMXPort *port)
++{
++  OMX_ERRORTYPE err;
++  guint i;
++  gint64 deadline = gst_omx_wait_deadline (5 * GST_SECOND);
++  gboolean flushing = FALSE;
++
+   g_mutex_lock (&port->comp->lock);
+-  err = gst_omx_port_deallocate_buffers_unlocked (port);
++retry:
++  gst_omx_component_handle_messages (port->comp);
++  if (port->buffers) {
++    for (i = 0; i < port->buffers->len; i++) {
++      GstOMXBuffer *buf = g_ptr_array_index (port->buffers, i);
++
++      if (buf->used) {
++        if (!flushing) {
++          /* A downstream pool can be stopped before the decoder transitions
++           * to Idle. Reclaim OMX-owned buffers on this worker, not on the
++           * downstream thread. */
++          g_mutex_unlock (&port->comp->lock);
++          gst_omx_port_set_flushing (port, 5 * GST_SECOND, TRUE);
++          g_mutex_lock (&port->comp->lock);
++          flushing = TRUE;
++          goto retry;
++        }
++        if (gst_omx_component_wait_message_until (port->comp, deadline))
++          goto retry;
++        g_mutex_unlock (&port->comp->lock);
++        return OMX_ErrorTimeout;
++      }
++    }
++  }
++  err = gst_omx_port_deallocate_buffers_unlocked (port, TRUE);
++  if (err == OMX_ErrorNone) {
++    port->using_pool = FALSE;
++    g_atomic_int_set (&port->retiring_pool, FALSE);
++  }
+   g_mutex_unlock (&port->comp->lock);
+ 
+   return err;
+@@ -3182,7 +3250,8 @@ gst_omx_port_populate_unlocked (GstOMXPort * port)
+ 
+   gst_omx_component_handle_messages (comp);
+ 
+-  if (port->flushing || port->disabled_pending || !port->port_def.bEnabled) {
++  if (port->flushing || g_atomic_int_get (&port->retiring_pool)
++      || port->disabled_pending || !port->port_def.bEnabled) {
+     GST_DEBUG_OBJECT (comp->parent, "%s port %u is flushing or disabled",
+         comp->name, port->index);
+     err = OMX_ErrorIncorrectStateOperation;
+diff --git a/omx/gstomx.h b/omx/gstomx.h
+index 31ccd2c..b3bf3fa 100644
+--- a/omx/gstomx.h
++++ b/omx/gstomx.h
+@@ -358,6 +358,7 @@ struct _GstOMXPort {
+   gboolean eos; /* TRUE after a buffer with EOS flag was received */
+   GstOMXBufferAllocation allocation;
+   gboolean using_pool; /* TRUE if the buffers of this port are managed by a pool */
++  gint retiring_pool; /* atomic; buffers cannot be freed/reused during retirement */
+ 
+   /* Increased whenever the settings of these port change.
+    * If settings_cookie != configured_settings_cookie
+@@ -490,6 +491,8 @@ OMX_ERRORTYPE     gst_omx_port_set_flushing (GstOMXPort *port, GstClockTime time
+ gboolean          gst_omx_port_is_flushing (GstOMXPort *port);
+ 
+ OMX_ERRORTYPE     gst_omx_port_allocate_buffers (GstOMXPort *port);
++void              gst_omx_port_begin_retirement (GstOMXPort *port);
++OMX_ERRORTYPE     gst_omx_port_finish_retirement (GstOMXPort *port);
+ OMX_ERRORTYPE     gst_omx_port_use_buffers (GstOMXPort *port, const GList *buffers);
+ OMX_ERRORTYPE     gst_omx_port_use_eglimages (GstOMXPort *port, const GList *images);
+ OMX_ERRORTYPE     gst_omx_port_deallocate_buffers (GstOMXPort *port);
+diff --git a/omx/gstomxallocator.c b/omx/gstomxallocator.c
+index 75728b0..50eda94 100644
+--- a/omx/gstomxallocator.c
++++ b/omx/gstomxallocator.c
+@@ -213,7 +213,7 @@ gst_omx_allocator_init (GstOMXAllocator * allocator)
+   GST_OBJECT_FLAG_SET (allocator, GST_ALLOCATOR_FLAG_CUSTOM_ALLOC);
+ 
+   g_mutex_init (&allocator->lock);
+-  g_cond_init (&allocator->cond);
++  g_cond_init (&allocator->released);
+ }
+ 
+ GstOMXAllocator *
+@@ -235,7 +235,7 @@ gst_omx_allocator_finalize (GObject * object)
+ 
+   gst_omx_component_unref (allocator->component);
+   g_mutex_clear (&allocator->lock);
+-  g_cond_clear (&allocator->cond);
++  g_cond_clear (&allocator->released);
+ 
+   G_OBJECT_CLASS (gst_omx_allocator_parent_class)->finalize (object);
+ }
+@@ -245,14 +245,18 @@ gst_omx_allocator_configure (GstOMXAllocator * allocator, guint count,
+     GstOMXAllocatorForeignMemMode mode)
+ {
+   /* check if already configured */
+-  if (allocator->n_memories > 0)
++  g_mutex_lock (&allocator->lock);
++  if (allocator->retiring || allocator->n_memories > 0) {
++    g_mutex_unlock (&allocator->lock);
+     return FALSE;
++  }
+ 
+   allocator->n_memories = count;
+   allocator->foreign_mode = mode;
+   if (mode == GST_OMX_ALLOCATOR_FOREIGN_MEM_DMABUF)
+     allocator->foreign_allocator = gst_dmabuf_allocator_new ();
+ 
++  g_mutex_unlock (&allocator->lock);
+   return TRUE;
+ }
+ 
+@@ -260,35 +264,33 @@ gst_omx_allocator_configure (GstOMXAllocator * allocator, guint count,
+ static void
+ gst_omx_allocator_dealloc (GstOMXAllocator * allocator)
+ {
++  guint i;
++
+   /* might be called more than once */
+   if (!allocator->memories)
+     return;
+ 
+   /* return foreign memory back to whoever lended it to us.
+    * the signal handler is expected to increase the ref count of foreign_mem */
+-  if (allocator->foreign_mode == GST_OMX_ALLOCATOR_FOREIGN_MEM_OTHER_POOL) {
+-    gint i;
+-    GstOMXMemory *m;
+-
+-    for (i = 0; i < allocator->memories->len; i++) {
+-      m = g_ptr_array_index (allocator->memories, i);
++  for (i = 0; i < allocator->memories->len; i++) {
++    GstOMXMemory *m = g_ptr_array_index (allocator->memories, i);
+ 
+-      /* this should not happen, but let's not crash for this */
+-      if (!m->foreign_mem) {
+-        GST_WARNING_OBJECT (allocator, "no foreign_mem to release");
+-        continue;
+-      }
+-
+-      /* restore the original dispose function */
++    /* Pool activation can fail after allocating only part of the table. */
++    if (!m)
++      continue;
++    if (m->foreign_mem) {
+       GST_MINI_OBJECT_CAST (m->foreign_mem)->dispose =
+           (GstMiniObjectDisposeFunction) m->foreign_dispose;
++      gst_mini_object_set_qdata (GST_MINI_OBJECT (m->foreign_mem),
++          GST_OMX_MEMORY_QUARK, NULL, NULL);
+ 
+-      g_signal_emit (allocator, signals[SIG_FOREIGN_MEM_RELEASED], 0, i,
+-          m->foreign_mem);
++      if (allocator->foreign_mode == GST_OMX_ALLOCATOR_FOREIGN_MEM_OTHER_POOL)
++        g_signal_emit (allocator, signals[SIG_FOREIGN_MEM_RELEASED], 0, i,
++            m->foreign_mem);
+     }
++    gst_memory_unref (GST_MEMORY_CAST (m));
+   }
+ 
+-  g_ptr_array_foreach (allocator->memories, (GFunc) gst_memory_unref, NULL);
+   g_ptr_array_free (allocator->memories, TRUE);
+   allocator->memories = NULL;
+   allocator->n_memories = 0;
+@@ -297,8 +299,6 @@ gst_omx_allocator_dealloc (GstOMXAllocator * allocator)
+     g_object_unref (allocator->foreign_allocator);
+     allocator->foreign_allocator = NULL;
+   }
+-
+-  g_cond_broadcast (&allocator->cond);
+ }
+ 
+ gboolean
+@@ -311,6 +311,15 @@ gst_omx_allocator_set_active (GstOMXAllocator * allocator, gboolean active)
+ 
+   g_mutex_lock (&allocator->lock);
+ 
++  /* Do not replace the memory table while a previous inactive allocator is
++   * still waiting for externally held memories to be returned. */
++  if (active && (allocator->memories || allocator->retiring)) {
++    GST_WARNING_OBJECT (allocator,
++        "Cannot reactivate allocator while old memories are still outstanding");
++    g_mutex_unlock (&allocator->lock);
++    return FALSE;
++  }
++
+   if (allocator->active != active)
+     changed = TRUE;
+ 
+@@ -319,7 +328,7 @@ gst_omx_allocator_set_active (GstOMXAllocator * allocator, gboolean active)
+       allocator->memories = g_ptr_array_sized_new (allocator->n_memories);
+       g_ptr_array_set_size (allocator->memories, allocator->n_memories);
+     } else {
+-      if (g_atomic_int_get (&allocator->n_outstanding) == 0)
++      if (allocator->n_outstanding == 0 && !allocator->retiring)
+         gst_omx_allocator_dealloc (allocator);
+     }
+   }
+@@ -331,35 +340,43 @@ gst_omx_allocator_set_active (GstOMXAllocator * allocator, gboolean active)
+ }
+ 
+ void
+-gst_omx_allocator_wait_inactive (GstOMXAllocator * allocator)
++gst_omx_allocator_retire (GstOMXAllocator * allocator)
+ {
+   g_mutex_lock (&allocator->lock);
+-  while (allocator->memories)
+-    g_cond_wait (&allocator->cond, &allocator->lock);
++  allocator->retiring = TRUE;
++  allocator->active = FALSE;
++  g_mutex_unlock (&allocator->lock);
++}
++
++/* Called only by the pool's cleanup worker, never by a memory dispose callback.
++ * The pool keeps the foreign GstBuffers alive until this has completed. */
++void
++gst_omx_allocator_finish_retirement (GstOMXAllocator * allocator)
++{
++  g_mutex_lock (&allocator->lock);
++  GST_DEBUG_OBJECT (allocator, "Retirement waiting for %u outstanding memories",
++      allocator->n_outstanding);
++  while (allocator->n_outstanding != 0)
++    g_cond_wait (&allocator->released, &allocator->lock);
++  gst_omx_allocator_dealloc (allocator);
++  GST_DEBUG_OBJECT (allocator, "Retired allocator memories released");
+   g_mutex_unlock (&allocator->lock);
+ }
+ 
+ static inline void
+ dec_outstanding (GstOMXAllocator * allocator)
+ {
+-  if (g_atomic_int_dec_and_test (&allocator->n_outstanding)) {
+-    /* keep a ref to the allocator because _dealloc() will free
+-     * all the memories and the memories might be the only thing holding
+-     * a reference to the allocator; we need to keep it alive until the
+-     * end of this function call */
+-    g_object_ref (allocator);
+-
+-    /* take the lock so that _set_active() is not run concurrently */
+-    g_mutex_lock (&allocator->lock);
+-
+-    /* now that we have the lock, check if we have been de-activated with
+-     * outstanding buffers */
+-    if (!allocator->active)
++  /* Take the reference and lock BEFORE decrementing. Otherwise retirement can
++   * observe zero and destroy the memory/allocator before we take the lock. */
++  gst_object_ref (allocator);
++  g_mutex_lock (&allocator->lock);
++  if (--allocator->n_outstanding == 0) {
++    if (!allocator->active && !allocator->retiring)
+       gst_omx_allocator_dealloc (allocator);
+-
+-    g_mutex_unlock (&allocator->lock);
+-    g_object_unref (allocator);
++    g_cond_broadcast (&allocator->released);
+   }
++  g_mutex_unlock (&allocator->lock);
++  gst_object_unref (allocator);
+ }
+ 
+ GstFlowReturn
+@@ -369,8 +386,8 @@ gst_omx_allocator_acquire (GstOMXAllocator * allocator, GstMemory ** memory,
+   GstFlowReturn ret = GST_FLOW_OK;
+   GstOMXMemory *omx_mem = NULL;
+ 
+-  /* ensure memories are not going to disappear concurrently */
+-  g_atomic_int_inc (&allocator->n_outstanding);
++  g_mutex_lock (&allocator->lock);
++  allocator->n_outstanding++;
+ 
+   if (!allocator->active) {
+     ret = GST_FLOW_FLUSHING;
+@@ -393,7 +410,7 @@ gst_omx_allocator_acquire (GstOMXAllocator * allocator, GstMemory ** memory,
+     goto beach;
+   }
+ 
+-  if (G_UNLIKELY (omx_mem->buf->used)) {
++  if (G_UNLIKELY (omx_mem->acquired || omx_mem->buf->used)) {
+     GST_ERROR_OBJECT (allocator,
+         "Trying to acquire a buffer that is being used by the OMX port");
+     ret = GST_FLOW_ERROR;
+@@ -408,6 +425,7 @@ gst_omx_allocator_acquire (GstOMXAllocator * allocator, GstMemory ** memory,
+     *memory = GST_MEMORY_CAST (omx_mem);
+ 
+ beach:
++  g_mutex_unlock (&allocator->lock);
+   if (ret != GST_FLOW_OK)
+     dec_outstanding (allocator);
+   return ret;
+@@ -514,6 +532,7 @@ gst_omx_allocator_allocate (GstOMXAllocator * allocator, gint index,
+           omx_buf);
+       if (!mem->foreign_mem) {
+         GST_ERROR_OBJECT(allocator, "dmabuf allocation failed");
++        gst_memory_unref (GST_MEMORY_CAST (mem));
+         return NULL;
+       }
+       gst_mini_object_set_qdata (GST_MINI_OBJECT (mem->foreign_mem),
+diff --git a/omx/gstomxallocator.h b/omx/gstomxallocator.h
+index 5c94584..8c83c41 100644
+--- a/omx/gstomxallocator.h
++++ b/omx/gstomxallocator.h
+@@ -78,9 +78,10 @@ struct _GstOMXAllocator
+ 
+   guint n_outstanding;
+   gboolean active;
++  gboolean retiring;
+ 
+   GMutex lock;
+-  GCond cond;
++  GCond released;
+ };
+ 
+ struct _GstOMXAllocatorClass
+@@ -101,7 +102,8 @@ gboolean gst_omx_allocator_configure (GstOMXAllocator * allocator, guint count,
+     GstOMXAllocatorForeignMemMode mode);
+ gboolean gst_omx_allocator_set_active (GstOMXAllocator * allocator,
+     gboolean active);
+-void gst_omx_allocator_wait_inactive (GstOMXAllocator * allocator);
++void gst_omx_allocator_retire (GstOMXAllocator * allocator);
++void gst_omx_allocator_finish_retirement (GstOMXAllocator * allocator);
+ 
+ GstFlowReturn gst_omx_allocator_acquire (GstOMXAllocator * allocator,
+     GstMemory ** memory, gint index, GstOMXBuffer * omx_buf);
+diff --git a/omx/gstomxbufferpool.c b/omx/gstomxbufferpool.c
+index 1f45bf1..e08be10 100644
+--- a/omx/gstomxbufferpool.c
++++ b/omx/gstomxbufferpool.c
+@@ -110,6 +110,10 @@ G_DEFINE_TYPE_WITH_CODE (GstOMXBufferPool, gst_omx_buffer_pool,
+ static void gst_omx_buffer_pool_free_buffer (GstBufferPool * bpool,
+     GstBuffer * buffer);
+ 
++static gpointer gst_omx_buffer_pool_cleanup (gpointer data);
++static void gst_omx_buffer_pool_return_buffer (GstOMXBufferPool * pool,
++    GstBuffer * buffer);
++
+ static gboolean
+ gst_omx_buffer_pool_start (GstBufferPool * bpool)
+ {
+@@ -122,14 +126,21 @@ gst_omx_buffer_pool_start (GstBufferPool * bpool)
+   /* Only allow to start the pool if we still are attached
+    * to a component and port */
+   GST_OBJECT_LOCK (pool);
+-  if (!pool->component || !pool->port) {
++  if (!pool->component || !pool->port || pool->retired) {
+     GST_OBJECT_UNLOCK (pool);
+     return FALSE;
+   }
+ 
+   pool->port->using_pool = TRUE;
+ 
++  g_mutex_lock (&pool->component->lock);
++  if (g_atomic_int_get (&pool->port->retiring_pool)) {
++    g_mutex_unlock (&pool->component->lock);
++    GST_OBJECT_UNLOCK (pool);
++    return FALSE;
++  }
+   has_buffers = (pool->port->buffers != NULL);
++  g_mutex_unlock (&pool->component->lock);
+   GST_OBJECT_UNLOCK (pool);
+ 
+   config = gst_buffer_pool_get_config (bpool);
+@@ -175,6 +186,8 @@ gst_omx_buffer_pool_start (GstBufferPool * bpool)
+   if (!gst_omx_allocator_set_active (pool->allocator, TRUE))
+     return FALSE;
+ 
++  g_atomic_int_set (&pool->deactivated, FALSE);
++
+   return
+       GST_BUFFER_POOL_CLASS (gst_omx_buffer_pool_parent_class)->start (bpool);
+ }
+@@ -183,30 +196,73 @@ static gboolean
+ gst_omx_buffer_pool_stop (GstBufferPool * bpool)
+ {
+   GstOMXBufferPool *pool = GST_OMX_BUFFER_POOL (bpool);
++  GThread *thread;
++  gboolean stopped;
+ 
+-  /* Remove any buffers that are there */
+-  g_ptr_array_set_size (pool->buffers, 0);
+-
+-  GST_DEBUG_OBJECT (pool, "deactivating OMX allocator");
+-  gst_omx_allocator_set_active (pool->allocator, FALSE);
+-
+-  /* ensure all memories have been deallocated;
+-   * this may take a while if some memories are being shared
+-   * and therefore are in use somewhere else in the pipeline */
+-  gst_omx_allocator_wait_inactive (pool->allocator);
++  GST_OBJECT_LOCK (pool);
++  if (pool->retired) {
++    GST_OBJECT_UNLOCK (pool);
++    return TRUE;
++  }
++  pool->retired = TRUE;
++  GST_OBJECT_UNLOCK (pool);
+ 
+-  GST_DEBUG_OBJECT (pool, "deallocate OMX buffers");
+-  gst_omx_port_deallocate_buffers (pool->port);
++  GST_DEBUG_OBJECT (pool, "Retiring OMX pool on cleanup worker");
++  g_atomic_int_set (&pool->deactivated, TRUE);
++  gst_omx_allocator_retire (pool->allocator);
++
++  /* Prevent a new pool or element teardown from freeing/replacing this port's
++   * buffers while the old allocator still exposes them downstream. */
++  gst_omx_port_begin_retirement (pool->port);
++
++  /* The parent must drain its queue under its own private lock. free_buffer()
++   * transfers ownership to retired_buffers instead of freeing the buffers:
++   * allocator cleanup must first restore imported memory to these buffers. */
++  stopped =
++      GST_BUFFER_POOL_CLASS (gst_omx_buffer_pool_parent_class)->stop (bpool);
++  if (!stopped) {
++    GST_ERROR_OBJECT (pool, "Parent pool still has buffers during retirement");
++    /* An inconsistent parent queue cannot safely be reclaimed asynchronously. */
++    gst_object_ref (pool);
++    return FALSE;
++  }
+ 
+   if (pool->caps)
+     gst_caps_unref (pool->caps);
+   pool->caps = NULL;
+ 
+   pool->add_videometa = FALSE;
+-  pool->deactivated = TRUE;
+-  pool->port->using_pool = TRUE;
++  thread = g_thread_new ("omx-pool-cleanup", gst_omx_buffer_pool_cleanup,
++      gst_object_ref (pool));
++  g_thread_unref (thread);
++  return TRUE;
++}
+ 
+-  return GST_BUFFER_POOL_CLASS (gst_omx_buffer_pool_parent_class)->stop (bpool);
++static gpointer
++gst_omx_buffer_pool_cleanup (gpointer data)
++{
++  GstOMXBufferPool *pool = data;
++  GstBuffer *buffer;
++
++  gst_omx_allocator_finish_retirement (pool->allocator);
++  GST_DEBUG_OBJECT (pool, "All OMX memories returned; freeing retired buffers");
++  g_ptr_array_set_size (pool->buffers, 0);
++
++  if (gst_omx_port_finish_retirement (pool->port) != OMX_ErrorNone) {
++    /* Do not destroy a component or return imported buffers while OMX may
++     * still use them. Keep this pool quarantined rather than risking UAF. */
++    GST_ERROR_OBJECT (pool,
++        "Cannot safely free retired OMX buffers; keeping pool");
++    return NULL;
++  }
++
++  while ((buffer = g_queue_pop_head (&pool->retired_buffers)))
++    gst_omx_buffer_pool_return_buffer (pool, buffer);
++
++  gst_omx_component_get_state (pool->component, 5 * GST_SECOND);
++  gst_object_unref (pool);
++
++  return NULL;
+ }
+ 
+ static const gchar **
+@@ -240,6 +296,11 @@ gst_omx_buffer_pool_set_config (GstBufferPool * bpool, GstStructure * config)
+ 
+   GST_OBJECT_LOCK (pool);
+ 
++  if (pool->retired) {
++    GST_OBJECT_UNLOCK (pool);
++    return FALSE;
++  }
++
+   if (!gst_buffer_pool_config_get_params (config, &caps, &size, &min, NULL))
+     goto wrong_config;
+ 
+@@ -489,6 +550,16 @@ gst_omx_buffer_pool_free_buffer (GstBufferPool * bpool, GstBuffer * buffer)
+ {
+   GstOMXBufferPool *pool = GST_OMX_BUFFER_POOL (bpool);
+ 
++  if (pool->retired) {
++    g_queue_push_tail (&pool->retired_buffers, buffer);
++    return;
++  }
++  gst_omx_buffer_pool_return_buffer (pool, buffer);
++}
++
++static void
++gst_omx_buffer_pool_return_buffer (GstOMXBufferPool * pool, GstBuffer * buffer)
++{
+   /* If the buffers belong to another pool, restore them now */
+   GST_OBJECT_LOCK (pool);
+   if (pool->other_pool) {
+@@ -497,8 +568,8 @@ gst_omx_buffer_pool_free_buffer (GstBufferPool * bpool, GstBuffer * buffer)
+   }
+   GST_OBJECT_UNLOCK (pool);
+ 
+-  GST_BUFFER_POOL_CLASS (gst_omx_buffer_pool_parent_class)->free_buffer (bpool,
+-      buffer);
++  GST_BUFFER_POOL_CLASS (gst_omx_buffer_pool_parent_class)->free_buffer
++      (GST_BUFFER_POOL (pool), buffer);
+ }
+ 
+ static GstFlowReturn
+@@ -603,8 +674,12 @@ on_allocator_omxbuf_released (GstOMXAllocator * allocator,
+ {
+   OMX_ERRORTYPE err;
+ 
+-  if (pool->port->port_def.eDir == OMX_DirOutput && !omx_buf->used &&
+-      !pool->deactivated) {
++  /* In particular, do not acquire the component lock from a late memory
++   * dispose while a retired component may be stuck in a vendor API. */
++  if (g_atomic_int_get (&pool->deactivated))
++    return;
++
++  if (pool->port->port_def.eDir == OMX_DirOutput && !omx_buf->used) {
+     /* Release back to the port, can be filled again */
+     err = gst_omx_port_release_buffer (pool->port, omx_buf);
+ 
+@@ -673,6 +748,7 @@ static void
+ gst_omx_buffer_pool_init (GstOMXBufferPool * pool)
+ {
+   pool->buffers = g_ptr_array_new ();
++  g_queue_init (&pool->retired_buffers);
+ }
+ 
+ GstBufferPool *
+diff --git a/omx/gstomxbufferpool.h b/omx/gstomxbufferpool.h
+index 33beed7..9b30351 100644
+--- a/omx/gstomxbufferpool.h
++++ b/omx/gstomxbufferpool.h
+@@ -71,7 +71,9 @@ struct _GstOMXBufferPool
+ 
+   /* Set from outside this pool */
+   /* TRUE if the pool is not used anymore */
+-  gboolean deactivated;
++  gint deactivated; /* atomic; also written by the decoder */
++  gboolean retired; /* protected by GST_OBJECT_LOCK; never reused */
++  GQueue retired_buffers; /* owns buffers removed by the parent's stop */
+ 
+   /* For populating the pool from another one */
+   GstBufferPool *other_pool;
+diff --git a/omx/gstomxvideodec.c b/omx/gstomxvideodec.c
+index 549f82f..b37f4e2 100644
+--- a/omx/gstomxvideodec.c
++++ b/omx/gstomxvideodec.c
+@@ -1453,7 +1453,8 @@ gst_omx_video_dec_allocate_output_buffers (GstOMXVideoDec * self)
+       self->out_port_pool = NULL;
+     } else if (!self->use_buffers) {
+       gst_buffer_pool_set_active (pool, FALSE);
+-      GST_OMX_BUFFER_POOL (self->out_port_pool)->deactivated = FALSE;
++      g_atomic_int_set (&GST_OMX_BUFFER_POOL (self->out_port_pool)->deactivated,
++          FALSE);
+     }
+   } else if (self->out_port_pool) {
+     gst_object_unref (self->out_port_pool);
+@@ -1484,7 +1485,8 @@ gst_omx_video_dec_deallocate_output_buffers (GstOMXVideoDec * self)
+ #if 0
+     gst_buffer_pool_wait_released (self->out_port_pool);
+ #endif
+-    GST_OMX_BUFFER_POOL (self->out_port_pool)->deactivated = TRUE;
++    g_atomic_int_set (&GST_OMX_BUFFER_POOL (self->out_port_pool)->deactivated,
++        TRUE);
+     gst_object_unref (self->out_port_pool);
+     self->out_port_pool = NULL;
+   } else {
+-- 
+2.43.0
+

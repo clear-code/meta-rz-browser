@@ -1,0 +1,54 @@
+From 04cf3d778525e8d92e8dba6c755ad391be631a08 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 28 Oct 2026 16:53:38 +0900
+Subject: [PATCH 2/5] omxvideodec: Release stream lock on Renesas
+ reconfiguration errors
+
+Release the decoder stream lock and return an OMX error when the Renesas
+crop or scaling configuration fails.
+
+Upstream-Status: Pending
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ omx/gstomxvideodec.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/omx/gstomxvideodec.c b/omx/gstomxvideodec.c
+index 3585720..323c3e3 100644
+--- a/omx/gstomxvideodec.c
++++ b/omx/gstomxvideodec.c
+@@ -1844,18 +1844,27 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
+ 
+   /* Update scale ratio base on decoded information */
+   if (self->bypass == FALSE) {
+-    if (!gst_omx_video_dec_get_cropped_resolution (self, &out_width, &out_height))
++    if (!gst_omx_video_dec_get_cropped_resolution (self, &out_width, &out_height)) {
++      GST_VIDEO_DECODER_STREAM_UNLOCK (self);
++      err = OMX_ErrorUndefined;
+       goto done;
++    }
+ 
+-    if (!get_omx_video_dec_set_scale (self, out_width, out_height))
++    if (!get_omx_video_dec_set_scale (self, out_width, out_height)) {
++      GST_VIDEO_DECODER_STREAM_UNLOCK (self);
++      err = OMX_ErrorUndefined;
+       goto done;
++    }
+ 
+     /* If there is cropped information in SPS, it means scale ratio is
+      * calculated incorrectly. So, nStride / nSliceHeight updated by OMX should
+      * not be used. */
+     if (!gst_omx_video_dec_get_resolution_from_src_pad (self, &out_width,
+-                                                        &out_height))
++                                                        &out_height)) {
++      GST_VIDEO_DECODER_STREAM_UNLOCK (self);
++      err = OMX_ErrorUndefined;
+       goto done;
++    }
+ 
+     port_def.format.video.nStride = MAX (out_width *
+         GST_VIDEO_FORMAT_INFO_PSTRIDE(info, 0), GST_OMX_VIDEO_DEC_MIN_STRIDE);
+-- 
+2.43.0
+

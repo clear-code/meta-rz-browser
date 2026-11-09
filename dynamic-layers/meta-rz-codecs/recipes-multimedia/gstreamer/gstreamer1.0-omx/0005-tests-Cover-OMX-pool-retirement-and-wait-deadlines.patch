@@ -1,0 +1,580 @@
+From 0404a7186cbb2a30eb756dac6bfff486717e7bfa Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 28 Oct 2026 16:53:38 +0900
+Subject: [PATCH 5/5] tests: Cover OMX pool retirement and wait deadlines
+
+Add hardware-independent lifetime, concurrent release and
+operation-deadline regression tests, together with Meson integration and
+test documentation. These optional tests require the retirement and
+deadline fixes.
+
+Upstream-Status: Pending
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ tests/check/generic/retirement.c     | 295 +++++++++++++++++++++++++++
+ tests/check/generic/retirement.md    |  59 ++++++
+ tests/check/generic/wait-deadlines.c | 153 ++++++++++++++
+ tests/check/meson.build              |  21 ++
+ 4 files changed, 528 insertions(+)
+ create mode 100644 tests/check/generic/retirement.c
+ create mode 100644 tests/check/generic/retirement.md
+ create mode 100644 tests/check/generic/wait-deadlines.c
+
+diff --git a/tests/check/generic/retirement.c b/tests/check/generic/retirement.c
+new file mode 100644
+index 0000000..58f7290
+--- /dev/null
++++ b/tests/check/generic/retirement.c
+@@ -0,0 +1,295 @@
++/* Hardware-independent regression tests for OMX pool retirement.
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * This executable links the real allocator/pool with a deliberately blocking
++ * mock OMX teardown. No OMX core or RZ hardware is required.
++ */
++#include "gstomxbufferpool.h"
++#include "gstomxvideo.h"
++
++typedef struct
++{
++  GstOMXComponent comp;
++  GstOMXPort port;
++  GMutex lock;
++  GCond cond;
++  gboolean entered_cleanup;
++  gboolean allow_cleanup;
++  gboolean pool_freed;
++  gboolean component_released;
++  gboolean imported;
++  GThread *caller;
++} Fixture;
++
++GstOMXComponent *
++gst_omx_component_ref (GstOMXComponent *comp)
++{
++  gst_mini_object_ref (GST_MINI_OBJECT_CAST (comp));
++  return comp;
++}
++
++void
++gst_omx_component_unref (GstOMXComponent *comp)
++{
++  Fixture *f = (Fixture *) comp;
++
++  gst_mini_object_unref (GST_MINI_OBJECT_CAST (comp));
++  g_mutex_lock (&f->lock);
++  if (GST_MINI_OBJECT_REFCOUNT_VALUE (comp) == 1) {
++    f->component_released = TRUE;
++    g_cond_broadcast (&f->cond);
++  }
++  g_mutex_unlock (&f->lock);
++}
++
++OMX_STATETYPE
++gst_omx_component_get_state (GstOMXComponent *comp, GstClockTime timeout)
++{
++  return OMX_StateLoaded;
++}
++
++const gchar *
++gst_omx_error_to_string (OMX_ERRORTYPE err)
++{
++  return "mock error";
++}
++
++gboolean
++gst_omx_video_get_port_padding (GstOMXPort *port, GstVideoInfo *info,
++    GstVideoAlignment *align)
++{
++  return FALSE;
++}
++
++GstOMXAcquireBufferReturn
++gst_omx_port_acquire_buffer (GstOMXPort *port, GstOMXBuffer **buf,
++    GstOMXWait wait)
++{
++  g_assert_not_reached ();
++  return GST_OMX_ACQUIRE_BUFFER_ERROR;
++}
++
++OMX_ERRORTYPE
++gst_omx_port_release_buffer (GstOMXPort *port, GstOMXBuffer *buf)
++{
++  /* No real hardware receives the buffer in this mock. */
++  return OMX_ErrorNone;
++}
++
++void
++gst_omx_port_requeue_buffer (GstOMXPort *port, GstOMXBuffer *buf)
++{
++  g_assert_not_reached ();
++}
++
++OMX_ERRORTYPE
++gst_omx_port_finish_retirement (GstOMXPort *port)
++{
++  Fixture *f = (Fixture *) port->comp;
++  guint i;
++
++  g_assert_true (g_thread_self () != f->caller);
++  g_mutex_lock (&f->lock);
++  f->entered_cleanup = TRUE;
++  g_cond_broadcast (&f->cond);
++  while (!f->allow_cleanup)
++    g_cond_wait (&f->cond, &f->lock);
++  g_mutex_unlock (&f->lock);
++
++  for (i = 0; i < port->buffers->len; i++) {
++    GstOMXBuffer *buf = g_ptr_array_index (port->buffers, i);
++
++    if (!f->imported)
++      g_free (buf->omx_buf->pBuffer);
++    g_free (buf->omx_buf);
++    g_free (buf);
++  }
++  g_ptr_array_unref (port->buffers);
++  port->buffers = NULL;
++  return OMX_ErrorNone;
++}
++
++void
++gst_omx_port_begin_retirement (GstOMXPort *port)
++{
++  g_atomic_int_set (&port->retiring_pool, TRUE);
++}
++
++static void
++pool_finalized (gpointer data, GObject *object)
++{
++  Fixture *f = data;
++
++  g_mutex_lock (&f->lock);
++  f->pool_freed = TRUE;
++  g_cond_broadcast (&f->cond);
++  g_mutex_unlock (&f->lock);
++}
++
++static void
++wait_flag (Fixture *f, gboolean *flag)
++{
++  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
++
++  g_mutex_lock (&f->lock);
++  while (!*flag)
++    g_assert_true (g_cond_wait_until (&f->cond, &f->lock, deadline));
++  g_mutex_unlock (&f->lock);
++}
++
++static gpointer
++release_memory (gpointer data)
++{
++  gst_memory_unref (data);
++  return NULL;
++}
++
++static void
++check_retirement (gboolean imported, gboolean shared, gboolean concurrent)
++{
++  Fixture f = { 0 };
++  GstElement *element = gst_pipeline_new (NULL);
++  GstBufferPool *pool, *other = NULL;
++  GstOMXBufferPool *opool;
++  GstBuffer *buffer;
++  GstMemory *memory = NULL;
++  GThread *releaser = NULL;
++  GstCaps *caps =
++      gst_caps_from_string
++      ("video/x-raw,format=GRAY8,width=16,height=16,framerate=30/1");
++  GstStructure *config;
++  GstOMXBuffer *omx = g_new0 (GstOMXBuffer, 1);
++
++  g_mutex_init (&f.lock);
++  g_cond_init (&f.cond);
++  g_mutex_init (&f.comp.lock);
++  gst_mini_object_init (GST_MINI_OBJECT_CAST (&f.comp), 0,
++      GST_TYPE_MINI_OBJECT, NULL, NULL, NULL);
++  f.caller = g_thread_self ();
++  f.imported = imported;
++  f.port.comp = &f.comp;
++  f.port.port_def.eDir = OMX_DirOutput;
++  f.port.port_def.eDomain = OMX_PortDomainVideo;
++  f.port.port_def.format.video.nStride = 16;
++  f.port.port_def.format.video.nSliceHeight = 16;
++  f.port.buffers = g_ptr_array_new ();
++  omx->port = &f.port;
++  omx->omx_buf = g_new0 (OMX_BUFFERHEADERTYPE, 1);
++  omx->omx_buf->nAllocLen = omx->omx_buf->nFilledLen = 256;
++  if (!imported)
++    omx->omx_buf->pBuffer = g_malloc0 (256);
++  g_ptr_array_add (f.port.buffers, omx);
++
++  pool = gst_omx_buffer_pool_new (element, &f.comp, &f.port,
++      GST_OMX_BUFFER_MODE_SYSTEM_MEMORY);
++  opool = GST_OMX_BUFFER_POOL (pool);
++  if (imported) {
++    other = gst_buffer_pool_new ();
++    config = gst_buffer_pool_get_config (other);
++    gst_buffer_pool_config_set_params (config, caps, 256, 1, 1);
++    g_assert_true (gst_buffer_pool_set_config (other, config));
++    g_assert_true (gst_buffer_pool_set_active (other, TRUE));
++    g_assert_cmpint (gst_buffer_pool_acquire_buffer (other, &buffer, NULL),
++        ==, GST_FLOW_OK);
++    g_ptr_array_add (opool->buffers, buffer);
++    opool->other_pool = gst_object_ref (other);
++  }
++
++  config = gst_buffer_pool_get_config (pool);
++  gst_buffer_pool_config_set_params (config, caps, 256, 1, 1);
++  g_assert_true (gst_buffer_pool_set_config (pool, config));
++  g_assert_true (gst_buffer_pool_set_active (pool, TRUE));
++  opool->current_buffer_index = 0;
++  g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &buffer, NULL),
++      ==, GST_FLOW_OK);
++  if (shared)
++    memory = gst_memory_share (gst_buffer_peek_memory (buffer, 0), 0, 128);
++  gst_buffer_unref (buffer);
++
++  g_object_weak_ref (G_OBJECT (pool), pool_finalized, &f);
++  if (concurrent)
++    releaser = g_thread_new ("last-memory-release", release_memory, memory);
++  /* Must return even though memory is still held or OMX teardown will block. */
++  g_assert_true (gst_buffer_pool_set_active (pool, FALSE));
++  g_assert_false (gst_buffer_pool_set_active (pool, TRUE));
++  g_assert_false (gst_omx_allocator_configure (opool->allocator, 1,
++          GST_OMX_ALLOCATOR_FOREIGN_MEM_NONE));
++  if (shared && !concurrent) {
++    g_mutex_lock (&f.lock);
++    g_assert_false (f.entered_cleanup);
++    g_mutex_unlock (&f.lock);
++    /* Returning the LAST memory must not execute/block in OMX teardown. */
++    gst_memory_unref (memory);
++  }
++  if (releaser)
++    g_thread_join (releaser);
++  wait_flag (&f, &f.entered_cleanup);
++  gst_object_unref (pool);
++  g_mutex_lock (&f.lock);
++  g_assert_false (f.pool_freed);
++  f.allow_cleanup = TRUE;
++  g_cond_broadcast (&f.cond);
++  g_mutex_unlock (&f.lock);
++  wait_flag (&f, &f.pool_freed);
++  wait_flag (&f, &f.component_released);
++
++  if (other) {
++    GstMemory *mem;
++
++    g_assert_cmpint (gst_buffer_pool_acquire_buffer (other, &buffer, NULL),
++        ==, GST_FLOW_OK);
++    g_assert_cmpuint (gst_buffer_get_size (buffer), ==, 256);
++    mem = gst_buffer_peek_memory (buffer, 0);
++    g_assert_null (gst_omx_memory_get_omx_buf (mem));
++    gst_buffer_unref (buffer);
++    g_assert_true (gst_buffer_pool_set_active (other, FALSE));
++    gst_object_unref (other);
++  }
++  /* No allocator or pool reference is allowed to survive successful cleanup. */
++  g_assert_cmpint (GST_MINI_OBJECT_REFCOUNT_VALUE (&f.comp), ==, 1);
++  gst_omx_component_unref (&f.comp);
++  gst_object_unref (element);
++  gst_caps_unref (caps);
++  g_mutex_clear (&f.comp.lock);
++  g_mutex_clear (&f.lock);
++  g_cond_clear (&f.cond);
++}
++
++static void
++test_export (void)
++{
++  check_retirement (FALSE, TRUE, FALSE);
++}
++
++static void
++test_import (void)
++{
++  check_retirement (TRUE, TRUE, FALSE);
++}
++
++static void
++test_no_outstanding (void)
++{
++  check_retirement (FALSE, FALSE, FALSE);
++}
++
++static void
++test_concurrent (void)
++{
++  guint i;
++
++  for (i = 0; i < 100; i++)
++    check_retirement (i % 2, TRUE, TRUE);
++}
++
++int
++main (int argc, char **argv)
++{
++  gst_init (&argc, &argv);
++  g_test_init (&argc, &argv, NULL);
++  g_test_add_func ("/omx/retirement/export-shared", test_export);
++  g_test_add_func ("/omx/retirement/import-shared", test_import);
++  g_test_add_func ("/omx/retirement/no-outstanding", test_no_outstanding);
++  g_test_add_func ("/omx/retirement/concurrent", test_concurrent);
++  return g_test_run ();
++}
+diff --git a/tests/check/generic/retirement.md b/tests/check/generic/retirement.md
+new file mode 100644
+index 0000000..98305a9
+--- /dev/null
++++ b/tests/check/generic/retirement.md
+@@ -0,0 +1,59 @@
++# OMX retirement regression tests
++
++`omx_retirement` links the real buffer pool and allocator to a mock OMX teardown.
++It does not need an OMX core or RZ hardware. The mock blocks teardown until the
++test explicitly releases it, and checks that teardown is not on the calling
++thread. Tests cover exported memory, imported downstream memory, no outstanding
++memory, and 100 iterations racing the last memory release against pool stop.
++Imported buffers must regain their memory with no stale OMX qdata. Successful
++cleanup must release all pool/allocator component references.
++
++`omx_wait_deadlines` exercises the real component/port wait loops with a mock
++which never acknowledges commands, but wakes waiters every millisecond. The
++50 ms operation deadline must not be restarted by these unrelated notifications.
++It covers state, flush, buffer return and port enable/disable waits.
++
++With tests enabled, build the two executables and run them with Meson:
++
++```sh
++ninja -C BUILD tests/check/omx_retirement tests/check/omx_wait_deadlines
++meson test -C BUILD --no-rebuild omx_retirement omx_wait_deadlines --print-errorlogs
++```
++
++For a native AddressSanitizer/UndefinedBehaviorSanitizer retirement test:
++
++```sh
++cc -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
++  -Iomx -Iomx/openmax tests/check/generic/retirement.c \
++  omx/gstomxallocator.c omx/gstomxbufferpool.c \
++  $(pkg-config --cflags --libs gstreamer-video-1.0 gstreamer-allocators-1.0) \
++  -o /tmp/opencode/omx-retirement-test
++/tmp/opencode/omx-retirement-test
++```
++
++## Lifetime and failure policy
++
++Pool stop marks the pool permanently retired and prevents port reuse. The
++parent pool drains its queue synchronously under its private lock, but its
++`free_buffer` calls transfer buffer ownership to the retired pool instead of
++returning imported buffers downstream. A detached worker owns a pool reference,
++which keeps its allocator, component, decoder and downstream pool alive.
++
++Memory dispose notifies the worker only after the release callback has finished.
++The worker waits for the last external memory, restores foreign memory and its
++original dispose function, clears OMX qdata, and releases the OMX buffers. Only
++then does it return imported buffers and release its pool reference. Normal
++cleanup leaves no worker-held references. No private parent-pool methods are
++called from the worker.
++
++An external memory reference which is never returned necessarily keeps the
++worker/pool/component alive. If OMX retains buffers past the retirement timeout,
++or buffer freeing fails, the worker logs an error and quarantines its pool
++reference instead of destroying memory potentially still used by OMX. This is
++an intentional safety fallback, not a guarantee of resource reclamation from a
++broken OMX component. A blocking OMX API may also strand the cleanup worker;
++it no longer blocks the downstream memory-return thread.
++
++Real hardware tests are still needed for repeated Chromium open/close, seeks,
++resolution changes, and actual RZ DMA-BUF export/import. The mocks do not verify
++vendor OMX state-machine behavior or kernel/hardware resource release.
+diff --git a/tests/check/generic/wait-deadlines.c b/tests/check/generic/wait-deadlines.c
+new file mode 100644
+index 0000000..f69fba3
+--- /dev/null
++++ b/tests/check/generic/wait-deadlines.c
+@@ -0,0 +1,153 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * Exercise the real wait loops with a mock OMX component which never ACKs,
++ * but continuously wakes unrelated message waiters.
++ * Unused plugin registration code is discarded by the linker.
++ */
++#define PACKAGE "gst-omx-tests"
++#define PACKAGE_VERSION "test"
++#define GST_LICENSE "LGPL"
++#define GST_PACKAGE_NAME "gst-omx-tests"
++#define GST_PACKAGE_ORIGIN "https://gstreamer.freedesktop.org"
++#define GST_OMX_CONFIG_DIR "."
++#include <gst/gst.h>
++/* Do not export a plugin descriptor: this executable only tests wait loops. */
++#undef GST_PLUGIN_DEFINE
++#define GST_PLUGIN_DEFINE(...)
++#include "../../../omx/gstomx.c"
++
++typedef struct
++{
++  GstOMXComponent comp;
++  GstOMXPort port;
++  OMX_COMPONENTTYPE handle;
++  gint stop;
++} WaitFixture;
++
++static OMX_ERRORTYPE
++mock_get_parameter (OMX_HANDLETYPE handle, OMX_INDEXTYPE index, OMX_PTR param)
++{
++  WaitFixture *f = ((OMX_COMPONENTTYPE *) handle)->pApplicationPrivate;
++
++  g_assert_cmpint (index, ==, OMX_IndexParamPortDefinition);
++  *(OMX_PARAM_PORTDEFINITIONTYPE *) param = f->port.port_def;
++  return OMX_ErrorNone;
++}
++
++static OMX_ERRORTYPE
++mock_send_command (OMX_HANDLETYPE handle, OMX_COMMANDTYPE command,
++    OMX_U32 param, OMX_PTR data)
++{
++  return OMX_ErrorNone;
++}
++
++static gpointer
++wake_waiters (gpointer data)
++{
++  WaitFixture *f = data;
++  gint64 end = g_get_monotonic_time () + 400 * G_TIME_SPAN_MILLISECOND;
++
++  while (!g_atomic_int_get (&f->stop) && g_get_monotonic_time () < end) {
++    gst_omx_component_send_message (&f->comp, NULL);
++    g_usleep (1000);
++  }
++  return NULL;
++}
++
++static void
++check_wait (gconstpointer data)
++{
++  WaitFixture f = { 0 };
++  GstOMXBuffer buffer = { 0 };
++  GThread *thread;
++  gint64 start, elapsed;
++  GstClockTime timeout = 50 * GST_MSECOND;
++
++  f.comp.parent = GST_OBJECT (gst_pipeline_new (NULL));
++  f.comp.name = g_strdup ("mock");
++  f.comp.handle = &f.handle;
++  f.comp.state = OMX_StateExecuting;
++  f.comp.pending_state = OMX_StatePause;
++  f.comp.ports = g_ptr_array_new ();
++  g_ptr_array_add (f.comp.ports, &f.port);
++  g_mutex_init (&f.comp.lock);
++  g_mutex_init (&f.comp.messages_lock);
++  g_cond_init (&f.comp.messages_cond);
++  f.handle.GetParameter = mock_get_parameter;
++  f.handle.SendCommand = mock_send_command;
++  f.handle.pApplicationPrivate = &f;
++  f.port.comp = &f.comp;
++  f.port.enabled_pending = TRUE;
++  f.port.buffers = g_ptr_array_new ();
++  g_ptr_array_add (f.port.buffers, &buffer);
++
++  thread = g_thread_new ("unrelated-notifications", wake_waiters, &f);
++  start = g_get_monotonic_time ();
++  switch (GPOINTER_TO_INT (data)) {
++    case 0:
++      g_assert_cmpint (gst_omx_component_get_state (&f.comp, timeout),
++          ==, OMX_StateInvalid);
++      break;
++    case 1:
++      g_assert_cmpint (gst_omx_port_set_flushing (&f.port, timeout, TRUE),
++          ==, OMX_ErrorTimeout);
++      break;
++    case 2:
++      g_assert_cmpint (gst_omx_port_wait_buffers_released (&f.port, timeout),
++          ==, OMX_ErrorTimeout);
++      break;
++    case 3:
++      g_assert_cmpint (gst_omx_port_wait_enabled (&f.port, timeout),
++          ==, OMX_ErrorTimeout);
++      break;
++  }
++  elapsed = g_get_monotonic_time () - start;
++  g_atomic_int_set (&f.stop, TRUE);
++  g_thread_join (thread);
++  g_assert_cmpint (elapsed, >=, 40 * G_TIME_SPAN_MILLISECOND);
++  g_assert_cmpint (elapsed, <, 300 * G_TIME_SPAN_MILLISECOND);
++
++  /* Retirement and ordinary deallocation must not wait for comp->lock, which
++   * may be held by a blocked vendor call on the cleanup worker. */
++  g_mutex_lock (&f.comp.lock);
++  gst_omx_port_begin_retirement (&f.port);
++  g_assert_cmpint (gst_omx_port_deallocate_buffers (&f.port),
++      ==, OMX_ErrorIncorrectStateOperation);
++  g_mutex_unlock (&f.comp.lock);
++  g_assert_cmpint (gst_omx_port_allocate_buffers (&f.port),
++      ==, OMX_ErrorIncorrectStateOperation);
++  g_assert_cmpint (gst_omx_port_populate (&f.port),
++      ==, OMX_ErrorIncorrectStateOperation);
++  {
++    GstOMXBuffer *acquired = NULL;
++
++    g_assert_cmpint (gst_omx_port_acquire_buffer (&f.port, &acquired,
++            GST_OMX_WAIT), ==, GST_OMX_ACQUIRE_BUFFER_FLUSHING);
++    g_assert_null (acquired);
++  }
++
++  g_ptr_array_unref (f.port.buffers);
++  g_ptr_array_unref (f.comp.ports);
++  gst_object_unref (f.comp.parent);
++  g_free (f.comp.name);
++  g_mutex_clear (&f.comp.lock);
++  g_mutex_clear (&f.comp.messages_lock);
++  g_cond_clear (&f.comp.messages_cond);
++}
++
++int
++main (int argc, char **argv)
++{
++  gst_init (&argc, &argv);
++  g_test_init (&argc, &argv, NULL);
++  GST_DEBUG_CATEGORY_INIT (gstomx_debug, "omx", 0, "mock OMX tests");
++  GST_DEBUG_CATEGORY_INIT (OMX_API_TRACE, "OMX_API_TRACE", 0, "mock OMX API");
++  /* Keep a reference for -Wunused-function without registering the plugin. */
++  (void) plugin_init;
++  g_test_add_data_func ("/omx/deadline/state", GINT_TO_POINTER (0), check_wait);
++  g_test_add_data_func ("/omx/deadline/flush", GINT_TO_POINTER (1), check_wait);
++  g_test_add_data_func ("/omx/deadline/buffers", GINT_TO_POINTER (2),
++      check_wait);
++  g_test_add_data_func ("/omx/deadline/enable", GINT_TO_POINTER (3),
++      check_wait);
++  return g_test_run ();
++}
+diff --git a/tests/check/meson.build b/tests/check/meson.build
+index b43a517..801870e 100644
+--- a/tests/check/meson.build
++++ b/tests/check/meson.build
+@@ -54,3 +54,24 @@ foreach t : omx_tests
+     test(test_name, exe, env: env, timeout: 3 * 60)
+   endif
+ endforeach
++
++# Compile without HAVE_CONFIG_H: exercise generic memory lifetime handling
++# without linking a hardware OMX core or the platform DMA-BUF exporter.
++retirement_test = executable('omx_retirement',
++  'generic/retirement.c',
++  '../../omx/gstomxallocator.c', '../../omx/gstomxbufferpool.c',
++  include_directories : [include_directories('../../omx'), omx_inc],
++  dependencies : [gst_dep, gstvideo_dep, gstallocators_dep, glib_dep],
++)
++test('omx_retirement', retirement_test, timeout : 30)
++
++if cc.has_link_argument('-Wl,--gc-sections')
++  deadline_test = executable('omx_wait_deadlines',
++    'generic/wait-deadlines.c',
++    include_directories : [include_directories('../../omx'), omx_inc],
++    c_args : ['-ffunction-sections', '-fdata-sections'],
++    link_args : ['-Wl,--gc-sections'],
++    dependencies : [gst_dep, gstvideo_dep, gstallocators_dep, gmodule_dep],
++  )
++  test('omx_wait_deadlines', deadline_test, timeout : 30)
++endif
+-- 
+2.43.0
+

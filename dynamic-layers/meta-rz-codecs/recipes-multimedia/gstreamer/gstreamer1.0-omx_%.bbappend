@@ -6,6 +6,11 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}/:"
 SRC_URI += " \
     file://0001-omx-Drop-empty-video-decoder-outputs.patch \
     file://0001-omxvideodec-Align-DMA-BUF-output-stride.patch \
+    file://0001-omx-Bound-component-and-port-waits-by-operation-dead.patch \
+    file://0002-omxvideodec-Release-stream-lock-on-Renesas-reconfigu.patch \
+    file://0003-omxvideodec-Keep-failed-flushes-from-resuming-decodi.patch \
+    file://0004-omxbufferpool-Retire-shared-OMX-buffers-on-a-cleanup.patch \
+    file://0005-tests-Cover-OMX-pool-retirement-and-wait-deadlines.patch \
 "
 
 # The upstream FLUSH event handling now wakes the input port on FLUSH_START and

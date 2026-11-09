@@ -1,0 +1,303 @@
+From d81bd1ee6864a5c09603c78621b598ad3fd08605 Mon Sep 17 00:00:00 2001
+From: Takuro Ashie <ashie@clear-code.com>
+Date: Wed, 28 Oct 2026 16:53:38 +0900
+Subject: [PATCH 3/5] omxvideodec: Keep failed flushes from resuming decoding
+
+Check state transitions and port operations, propagate flush failure,
+keep ports flushing and notify downstream before waiting for OMX
+acknowledgements. GstVideoDecoder 1.22 ignores the flush vfunc return
+value, so preserve an explicit failure flag.
+
+Upstream-Status: Pending
+
+Signed-off-by: Takuro Ashie <ashie@clear-code.com>
+---
+ omx/gstomxvideodec.c | 189 +++++++++++++++++++++++++++----------------
+ omx/gstomxvideodec.h |   1 +
+ 2 files changed, 122 insertions(+), 68 deletions(-)
+
+diff --git a/omx/gstomxvideodec.c b/omx/gstomxvideodec.c
+index 323c3e3..549f82f 100644
+--- a/omx/gstomxvideodec.c
++++ b/omx/gstomxvideodec.c
+@@ -663,6 +663,7 @@ gst_omx_video_dec_change_state (GstElement * element, GstStateChange transition)
+     case GST_STATE_CHANGE_NULL_TO_READY:
+       break;
+     case GST_STATE_CHANGE_READY_TO_PAUSED:
++      g_atomic_int_set (&self->flush_failed, FALSE);
+       self->downstream_flow_ret = GST_FLOW_OK;
+       self->draining = FALSE;
+       self->started = FALSE;
+@@ -3655,6 +3656,79 @@ gst_omx_video_dec_set_format (GstVideoDecoder * decoder,
+   return TRUE;
+ }
+ 
++static OMX_ERRORTYPE
++gst_omx_video_dec_flush_ports (GstOMXVideoDec *self, gboolean flushing)
++{
++  GstOMXPort *ports[] = {
++    self->dec_in_port, self->dec_out_port,
++#if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
++    self->eglimage ? self->egl_in_port : NULL,
++    self->eglimage ? self->egl_out_port : NULL,
++#endif
++  };
++  OMX_ERRORTYPE err = OMX_ErrorNone;
++  guint i;
++
++  /* Always visit every port, even when flushing one of them fails, so both
++   * input and output acquisition waiters get a chance to exit. */
++  for (i = 0; i < G_N_ELEMENTS (ports); i++) {
++    if (ports[i]) {
++      OMX_ERRORTYPE tmp = gst_omx_port_set_flushing (ports[i],
++          5 * GST_SECOND, flushing);
++      if (err == OMX_ErrorNone)
++        err = tmp;
++    }
++  }
++  return err;
++}
++
++static OMX_ERRORTYPE
++gst_omx_video_dec_wait_state (GstOMXComponent *comp, OMX_STATETYPE state)
++{
++  OMX_ERRORTYPE err = gst_omx_component_set_state (comp, state);
++
++  if (err != OMX_ErrorNone)
++    return err;
++  return gst_omx_component_get_state (comp, 5 * GST_SECOND) == state ?
++      OMX_ErrorNone : OMX_ErrorTimeout;
++}
++
++static OMX_ERRORTYPE
++gst_omx_video_dec_prepare_flush (GstOMXVideoDec *self)
++{
++  OMX_ERRORTYPE err = OMX_ErrorNone, tmp;
++  OMX_STATETYPE state = gst_omx_component_get_state (self->dec, 0);
++
++  if (state == OMX_StateInvalid)
++    err = OMX_ErrorIncorrectStateOperation;
++  else if (state == OMX_StateExecuting)
++    err = gst_omx_video_dec_wait_state (self->dec, OMX_StatePause);
++#if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
++  if (self->eglimage && gst_omx_component_get_state (self->egl_render, 0) ==
++      OMX_StateExecuting) {
++    tmp = gst_omx_video_dec_wait_state (self->egl_render, OMX_StatePause);
++    if (err == OMX_ErrorNone)
++      err = tmp;
++  }
++#endif
++  tmp = gst_omx_video_dec_flush_ports (self, TRUE);
++  return err == OMX_ErrorNone ? tmp : err;
++}
++
++static void
++gst_omx_video_dec_fail_flush (GstOMXVideoDec *self, OMX_ERRORTYPE err)
++{
++  g_atomic_int_set (&self->flush_failed, TRUE);
++  gst_omx_video_dec_flush_ports (self, TRUE);
++  g_mutex_lock (&self->drain_lock);
++  self->draining = FALSE;
++  g_cond_broadcast (&self->drain_cond);
++  g_mutex_unlock (&self->drain_lock);
++  GST_ELEMENT_ERROR (self, LIBRARY, FAILED, ("Failed to flush OMX decoder"),
++      ("%s (0x%08x); keeping ports flushing", gst_omx_error_to_string (err),
++          err));
++}
++
+ static gboolean
+ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+ {
+@@ -3663,34 +3737,18 @@ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+ 
+   GST_DEBUG_OBJECT (self, "Flushing decoder");
+ 
+-  if (gst_omx_component_get_state (self->dec, 0) == OMX_StateLoaded)
+-    return TRUE;
++  if (g_atomic_int_get (&self->flush_failed))
++    return FALSE;
+ 
+-  /* 0) Pause the components */
+-  if (gst_omx_component_get_state (self->dec, 0) == OMX_StateExecuting) {
+-    gst_omx_component_set_state (self->dec, OMX_StatePause);
+-    gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+-  }
+-#if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+-  if (self->eglimage) {
+-    if (gst_omx_component_get_state (self->egl_render, 0) == OMX_StateExecuting) {
+-      gst_omx_component_set_state (self->egl_render, OMX_StatePause);
+-      gst_omx_component_get_state (self->egl_render, 5 * GST_SECOND);
+-    }
+-  }
+-#endif
++  if (!self->dec)
++    return TRUE;
+ 
+-  /* 1) Flush the ports */
+-  GST_DEBUG_OBJECT (self, "flushing ports");
+-  gst_omx_port_set_flushing (self->dec_in_port, 5 * GST_SECOND, TRUE);
+-  gst_omx_port_set_flushing (self->dec_out_port, 5 * GST_SECOND, TRUE);
++  if (gst_omx_component_get_state (self->dec, 0) == OMX_StateLoaded)
++    return TRUE;
+ 
+-#if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+-  if (self->eglimage) {
+-    gst_omx_port_set_flushing (self->egl_in_port, 5 * GST_SECOND, TRUE);
+-    gst_omx_port_set_flushing (self->egl_out_port, 5 * GST_SECOND, TRUE);
+-  }
+-#endif
++  err = gst_omx_video_dec_prepare_flush (self);
++  if (err != OMX_ErrorNone)
++    goto failed;
+ 
+   /* 2) Wait until the srcpad loop is stopped,
+    * unlock GST_VIDEO_DECODER_STREAM_LOCK to prevent deadlocks
+@@ -3701,25 +3759,27 @@ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+   GST_VIDEO_DECODER_STREAM_LOCK (self);
+ 
+   /* 3) Resume components */
+-  gst_omx_component_set_state (self->dec, OMX_StateExecuting);
+-  gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
++  err = gst_omx_video_dec_wait_state (self->dec, OMX_StateExecuting);
++  if (err != OMX_ErrorNone)
++    goto failed;
+ #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+   if (self->eglimage) {
+-    gst_omx_component_set_state (self->egl_render, OMX_StateExecuting);
+-    gst_omx_component_get_state (self->egl_render, 5 * GST_SECOND);
++    err = gst_omx_video_dec_wait_state (self->egl_render, OMX_StateExecuting);
++    if (err != OMX_ErrorNone)
++      goto failed;
+   }
+ #endif
+ 
+   /* 4) Unset flushing to allow ports to accept data again */
+-  gst_omx_port_set_flushing (self->dec_in_port, 5 * GST_SECOND, FALSE);
+-  gst_omx_port_set_flushing (self->dec_out_port, 5 * GST_SECOND, FALSE);
++  err = gst_omx_video_dec_flush_ports (self, FALSE);
++  if (err != OMX_ErrorNone)
++    goto failed;
+ 
+ #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+   if (self->eglimage) {
+-    gst_omx_port_set_flushing (self->egl_in_port, 5 * GST_SECOND, FALSE);
+-    gst_omx_port_set_flushing (self->egl_out_port, 5 * GST_SECOND, FALSE);
+     err = gst_omx_port_populate (self->egl_out_port);
+-    gst_omx_port_mark_reconfigured (self->egl_out_port);
++    if (err == OMX_ErrorNone)
++      err = gst_omx_port_mark_reconfigured (self->egl_out_port);
+   } else {
+     err = gst_omx_port_populate (self->dec_out_port);
+   }
+@@ -3730,6 +3790,7 @@ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+   if (err != OMX_ErrorNone) {
+     GST_WARNING_OBJECT (self, "Failed to populate output port: %s (0x%08x)",
+         gst_omx_error_to_string (err), err);
++    goto failed;
+   }
+ 
+   /* Reset our state */
+@@ -3739,55 +3800,42 @@ gst_omx_video_dec_flush (GstVideoDecoder * decoder)
+   GST_DEBUG_OBJECT (self, "Flush finished");
+ 
+   return TRUE;
++
++failed:
++  gst_omx_video_dec_fail_flush (self, err);
++  self->downstream_flow_ret = GST_FLOW_ERROR;
++  return FALSE;
+ }
+ 
+ static gboolean
+ gst_omx_video_dec_sink_event (GstVideoDecoder * decoder, GstEvent * event)
+ {
+   GstOMXVideoDec *self;
++  gboolean ret;
++  OMX_ERRORTYPE err;
+ 
+   self = GST_OMX_VIDEO_DEC (decoder);
+ 
+   switch (GST_EVENT_TYPE (event)) {
+   case GST_EVENT_FLUSH_START:
+-    /* Although gst_omx_video_dec_flush() will be called in FLUSH_STOP event,
+-       start flushing earlier to make sure to flush. */
+-
+-    GST_DEBUG_OBJECT(self, "flush_start");
+-
+-    /* 0) Pause the components */
+-    if (gst_omx_component_get_state (self->dec, 0) == OMX_StateExecuting) {
+-      gst_omx_component_set_state (self->dec, OMX_StatePause);
+-      gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+-    }
+-#if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+-    if (self->eglimage) {
+-      if (gst_omx_component_get_state (self->egl_render, 0) == OMX_StateExecuting) {
+-	gst_omx_component_set_state (self->egl_render, OMX_StatePause);
+-        gst_omx_component_get_state (self->egl_render, 5 * GST_SECOND);
+-      }
+-    }
+-#endif
+-
+-    /* 1) Flush the ports */
+-    if (self->dec_in_port)
+-      gst_omx_port_set_flushing (self->dec_in_port, 5 * GST_SECOND, TRUE);
+-    if (self->dec_out_port)
+-      gst_omx_port_set_flushing (self->dec_out_port, 5 * GST_SECOND, TRUE);
+-#if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
+-    if (self->egl_in_port)
+-      gst_omx_port_set_flushing (self->egl_in_port, 5 * GST_SECOND, TRUE);
+-    if (self->egl_out_port)
+-      gst_omx_port_set_flushing (self->egl_out_port, 5 * GST_SECOND, TRUE);
+-#endif
+-
+-    GST_VIDEO_DECODER_CLASS
++    /* Unblock downstream before waiting for any OMX acknowledgement. */
++    ret = GST_VIDEO_DECODER_CLASS
+       (gst_omx_video_dec_parent_class)->sink_event (decoder, event);
+-    return TRUE;
++    if (!self->dec)
++      return ret;
++    err = gst_omx_video_dec_prepare_flush (self);
++    if (err != OMX_ErrorNone) {
++      gst_omx_video_dec_fail_flush (self, err);
++      return FALSE;
++    }
++    return ret;
+   case GST_EVENT_FLUSH_STOP:
+     /* gst_omx_video_dec_flush() will be called in parent sink_event(),
+        no need to finish flushing here. */
+-    break;
++    ret = GST_VIDEO_DECODER_CLASS
++      (gst_omx_video_dec_parent_class)->sink_event (decoder, event);
++    /* GstVideoDecoder 1.22 ignores the return value of its flush vfunc. */
++    return ret && !g_atomic_int_get (&self->flush_failed);
+   default:
+     break;
+   }
+@@ -3822,6 +3870,11 @@ gst_omx_video_dec_handle_frame (GstVideoDecoder * decoder,
+       "Handling frame %p last_subframe=%d header %d subframes %d", frame,
+       last_subframe, header, frame->abidata.ABI.num_subframes);
+ 
++  if (g_atomic_int_get (&self->flush_failed)) {
++    gst_video_codec_frame_unref (frame);
++    return GST_FLOW_ERROR;
++  }
++
+   if (self->downstream_flow_ret != GST_FLOW_OK) {
+     gst_video_codec_frame_unref (frame);
+     return self->downstream_flow_ret;
+diff --git a/omx/gstomxvideodec.h b/omx/gstomxvideodec.h
+index 5f75235..43015a4 100644
+--- a/omx/gstomxvideodec.h
++++ b/omx/gstomxvideodec.h
+@@ -78,6 +78,7 @@ struct _GstOMXVideoDec
+   gboolean draining; /* protected by drain_lock */
+ 
+   GstFlowReturn downstream_flow_ret;
++  gint flush_failed; /* atomic; FLUSH_START is not stream-serialized */
+   /* Initially FALSE. Switched to TRUE when all requirements
+    * are met to try setting up the decoder with OMX_UseBuffer.
+    * Switched to FALSE if this trial fails so that the decoder
+-- 
+2.43.0
+
